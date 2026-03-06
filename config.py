@@ -7,15 +7,22 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings
 DEFAULT_CONFIG = {
     "hotkey": "ctrl+shift+t",
     "capture_interval_ms": 1500,
+    "source_language": "ko",
     "target_language": "vi",
     "overlay_opacity": 0.85,
     "font_family": "Segoe UI",
     "font_size_min": 10,
     "font_size_max": 36,
-    "background_color": "#1a1a2e",
-    "text_color": "#ffffff",
-    "border_color": "#e94560",
-    "title_bar_color": "#16213e",
+    "background_color": "#ffffff",
+    "text_color": "#000000",
+    "border_color": "#ffffff",
+    "title_bar_color": "#1a1a2e",
+    # OCR backend strategy
+    "primary_backend": "rapidocr",
+    "fallback_backend": "paddleocr",
+    "confidence_thresh": 0.75,
+    "winrt_enabled": False,
+    "easyocr_enabled": False,
 }
 
 

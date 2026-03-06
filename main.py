@@ -1,6 +1,14 @@
 # main.py - Entry point with system tray and global hotkey
 import sys
-import keyboard
+
+# IMPORTANT: Import torch BEFORE PyQt6 to avoid DLL conflict on Windows
+# PyQt6 modifies DLL search paths which prevents torch's c10.dll from loading
+try:
+    import torch  # noqa: F401 - pre-load torch DLLs
+except (ImportError, OSError):
+    pass
+
+from pynput import keyboard as pynput_keyboard
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QAction, QFont, QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
@@ -14,6 +22,8 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QComboBox,
     QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
     QPushButton,
     QGroupBox,
     QMessageBox,
@@ -24,7 +34,25 @@ from config import load_config, save_config
 from overlay import OverlayWindow
 
 
-LANGUAGES = {
+# Source languages (for OCR - what's on screen)
+SOURCE_LANGUAGES = {
+    "en": "English",
+    "ko": "한국어",
+    "ja": "日本語",
+    "zh-CN": "中文 (简体)",
+    "zh-TW": "中文 (繁體)",
+    "fr": "Français",
+    "de": "Deutsch",
+    "es": "Español",
+    "th": "ไทย",
+    "ru": "Русский",
+    "pt": "Português",
+    "it": "Italiano",
+    "ar": "العربية",
+}
+
+# Target languages (translation output)
+TARGET_LANGUAGES = {
     "vi": "Tiếng Việt",
     "en": "English",
     "ja": "日本語",
@@ -173,31 +201,105 @@ class SettingsDialog(QDialog):
         hk_layout.addWidget(self._hotkey_edit)
         layout.addWidget(hotkey_group)
 
-        # ── Translation group ──
-        trans_group = QGroupBox("🌐 Dịch thuật")
-        tl = QVBoxLayout(trans_group)
+        # ── Language group ──
+        lang_group = QGroupBox("🌐 Ngôn ngữ")
+        ll = QVBoxLayout(lang_group)
 
-        tl.addWidget(QLabel("Ngôn ngữ đích:"))
-        self._lang_combo = QComboBox()
-        for code, name in LANGUAGES.items():
-            self._lang_combo.addItem(f"{name} ({code})", code)
-        current_lang = self._config.get("target_language", "vi")
-        idx = self._lang_combo.findData(current_lang)
+        ll.addWidget(QLabel("Ngôn ngữ gốc (trên màn hình):"))
+        self._source_lang_combo = QComboBox()
+        for code, name in SOURCE_LANGUAGES.items():
+            self._source_lang_combo.addItem(f"{name} ({code})", code)
+        current_source = self._config.get("source_language", "ko")
+        idx = self._source_lang_combo.findData(current_source)
         if idx >= 0:
-            self._lang_combo.setCurrentIndex(idx)
-        tl.addWidget(self._lang_combo)
+            self._source_lang_combo.setCurrentIndex(idx)
+        ll.addWidget(self._source_lang_combo)
 
-        tl.addWidget(QLabel("Chu kỳ dịch (ms):"))
+        ll.addWidget(QLabel("Ngôn ngữ dịch sang:"))
+        self._target_lang_combo = QComboBox()
+        for code, name in TARGET_LANGUAGES.items():
+            self._target_lang_combo.addItem(f"{name} ({code})", code)
+        current_target = self._config.get("target_language", "vi")
+        idx = self._target_lang_combo.findData(current_target)
+        if idx >= 0:
+            self._target_lang_combo.setCurrentIndex(idx)
+        ll.addWidget(self._target_lang_combo)
+
+        layout.addWidget(lang_group)
+
+        # ── Settings group ──
+        settings_group = QGroupBox("⚙ Cài đặt")
+        sl = QVBoxLayout(settings_group)
+
+        sl.addWidget(QLabel("Chu kỳ dịch (ms):"))
         self._interval_spin = QSpinBox()
         self._interval_spin.setRange(500, 5000)
         self._interval_spin.setSingleStep(100)
         self._interval_spin.setValue(self._config.get("capture_interval_ms", 1500))
         self._interval_spin.setSuffix(" ms")
-        tl.addWidget(self._interval_spin)
+        sl.addWidget(self._interval_spin)
 
-        layout.addWidget(trans_group)
+        layout.addWidget(settings_group)
 
-        # ── Buttons ──
+        # ── OCR Engine group ──
+        ocr_group = QGroupBox("🔍 OCR Engine")
+        ocr_group.setStyleSheet("""
+            QCheckBox {
+                color: #cccccc;
+                font-size: 12px;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid #2a2a4a;
+                background: #1a1a2e;
+            }
+            QCheckBox::indicator:checked {
+                background: #e94560;
+                border-color: #e94560;
+            }
+        """)
+        ol = QVBoxLayout(ocr_group)
+
+        # Info label
+        info_row = QHBoxLayout()
+        info_label = QLabel("Primary: RapidOCR  →  Fallback: PaddleOCR")
+        info_label.setStyleSheet("color: #00d2ff; font-size: 11px; font-style: italic;")
+        info_row.addWidget(info_label)
+        ol.addLayout(info_row)
+
+        # Confidence threshold
+        ol.addWidget(QLabel("Ngưỡng confidence fallback (0.60 → 0.95):"))
+        self._conf_spin = QDoubleSpinBox()
+        self._conf_spin.setRange(0.60, 0.95)
+        self._conf_spin.setSingleStep(0.05)
+        self._conf_spin.setDecimals(2)
+        self._conf_spin.setValue(self._config.get("confidence_thresh", 0.75))
+        self._conf_spin.setToolTip(
+            "Nếu avg confidence của RapidOCR < ngưỡng này → chạy PaddleOCR"
+        )
+        ol.addWidget(self._conf_spin)
+
+        # Checkbox: WinRT
+        self._winrt_cb = QCheckBox("Bật WinRT OCR (chỉ EN và một số ngôn ngữ có Language Pack)")
+        self._winrt_cb.setChecked(bool(self._config.get("winrt_enabled", False)))
+        self._winrt_cb.setToolTip(
+            "WinRT rất nhanh nhưng accuracy thấp với CJK. Tắt mặc định."
+        )
+        ol.addWidget(self._winrt_cb)
+
+        # Checkbox: EasyOCR
+        self._easyocr_cb = QCheckBox("Bật EasyOCR (ngôn ngữ hiếm: Thai, Arabic, v.v.)")
+        self._easyocr_cb.setChecked(bool(self._config.get("easyocr_enabled", False)))
+        self._easyocr_cb.setToolTip(
+            "EasyOCR chậm (~800ms) nhưng hỗ trợ nhiều ngôn ngữ nhất. Chỉ bật khi cần."
+        )
+        ol.addWidget(self._easyocr_cb)
+
+        layout.addWidget(ocr_group)
+
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
@@ -234,8 +336,12 @@ class SettingsDialog(QDialog):
     def _save(self):
         """Save settings and close."""
         self._config["hotkey"] = self._hotkey_edit.text()
-        self._config["target_language"] = self._lang_combo.currentData()
+        self._config["source_language"] = self._source_lang_combo.currentData()
+        self._config["target_language"] = self._target_lang_combo.currentData()
         self._config["capture_interval_ms"] = self._interval_spin.value()
+        self._config["confidence_thresh"] = self._conf_spin.value()
+        self._config["winrt_enabled"] = self._winrt_cb.isChecked()
+        self._config["easyocr_enabled"] = self._easyocr_cb.isChecked()
         save_config(self._config)
         self.accept()
 
@@ -277,7 +383,8 @@ class ScreenTranslatorApp:
 
         self._config = load_config()
         self._overlay: OverlayWindow | None = None
-        self._hotkey_registered = False
+        self._hotkey_listener = None
+        self._pressed_keys = set()
 
         self._setup_tray()
         self._register_hotkey()
@@ -322,7 +429,7 @@ class ScreenTranslatorApp:
 
         self._tray.setContextMenu(menu)
         self._tray.setToolTip("Screen Translator - Nhấn " + self._config["hotkey"])
-        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.activated.connect(lambda _reason: self._toggle_overlay())
         self._tray.show()
 
         # Show notification
@@ -333,23 +440,87 @@ class ScreenTranslatorApp:
             3000,
         )
 
+    def _parse_hotkey(self, hotkey_str: str):
+        """Parse hotkey string like 'ctrl+shift+t' into pynput keys."""
+        key_map = {
+            'ctrl': pynput_keyboard.Key.ctrl_l,
+            'shift': pynput_keyboard.Key.shift_l,
+            'alt': pynput_keyboard.Key.alt_l,
+        }
+        parts = hotkey_str.lower().split('+')
+        keys = set()
+        for part in parts:
+            part = part.strip()
+            if part in key_map:
+                keys.add(key_map[part])
+            elif len(part) == 1:
+                keys.add(pynput_keyboard.KeyCode.from_char(part))
+            else:
+                # Try as Key attribute (e.g., 'f1', 'space')
+                try:
+                    keys.add(getattr(pynput_keyboard.Key, part))
+                except AttributeError:
+                    keys.add(pynput_keyboard.KeyCode.from_char(part))
+        return keys
+
     def _register_hotkey(self):
-        """Register global hotkey."""
+        """Register global hotkey using pynput (no admin required)."""
         try:
-            if self._hotkey_registered:
-                keyboard.unhook_all_hotkeys()
-                self._hotkey_registered = False
+            # Stop existing listener
+            if self._hotkey_listener:
+                self._hotkey_listener.stop()
+                self._hotkey_listener = None
 
             hotkey = self._config.get("hotkey", "ctrl+shift+t")
-            keyboard.add_hotkey(hotkey, self._on_hotkey_pressed)
-            self._hotkey_registered = True
-        except Exception as e:
-            print(f"Failed to register hotkey: {e}")
+            self._target_keys = self._parse_hotkey(hotkey)
+            self._pressed_keys = set()
 
-    def _on_hotkey_pressed(self):
-        """Handle global hotkey press (called from keyboard thread)."""
-        # Use QTimer to safely call from the main thread
-        QTimer.singleShot(0, self._toggle_overlay)
+            def on_press(key):
+                self._pressed_keys.add(key)
+                # Normalize: check both left/right modifiers
+                if self._check_hotkey_match():
+                    QTimer.singleShot(0, self._toggle_overlay)
+
+            def on_release(key):
+                self._pressed_keys.discard(key)
+
+            self._hotkey_listener = pynput_keyboard.Listener(
+                on_press=on_press,
+                on_release=on_release,
+            )
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+            print(f"[Hotkey] Registered: {hotkey}", flush=True)
+        except Exception as e:
+            print(f"[Hotkey] Failed to register: {e}", flush=True)
+
+    def _check_hotkey_match(self) -> bool:
+        """Check if currently pressed keys match the target hotkey."""
+        for target in self._target_keys:
+            matched = False
+            for pressed in self._pressed_keys:
+                if target == pressed:
+                    matched = True
+                    break
+                # Handle left/right modifier variants
+                if isinstance(target, pynput_keyboard.Key):
+                    name = target.name
+                    if name.endswith('_l'):
+                        try:
+                            right = getattr(pynput_keyboard.Key, name[:-2] + '_r')
+                            if pressed == right:
+                                matched = True
+                                break
+                        except AttributeError:
+                            pass
+                # Handle KeyCode case-insensitive match
+                if isinstance(target, pynput_keyboard.KeyCode) and isinstance(pressed, pynput_keyboard.KeyCode):
+                    if target.char and pressed.char and target.char.lower() == pressed.char.lower():
+                        matched = True
+                        break
+            if not matched:
+                return False
+        return True
 
     def _toggle_overlay(self):
         """Toggle the overlay window visibility."""
@@ -387,14 +558,19 @@ class ScreenTranslatorApp:
 
     def _on_tray_activated(self, reason):
         """Handle tray icon activation."""
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        try:
+            if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+                self._toggle_overlay()
+        except TypeError:
+            # PyQt6 C++ enum conversion issue - just toggle on any activation
             self._toggle_overlay()
 
     def _quit(self):
         """Quit the application."""
         if self._overlay:
             self._overlay.close()
-        keyboard.unhook_all_hotkeys()
+        if self._hotkey_listener:
+            self._hotkey_listener.stop()
         self._tray.hide()
         self._app.quit()
 

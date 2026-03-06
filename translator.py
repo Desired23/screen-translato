@@ -7,8 +7,9 @@ import threading
 class TranslationEngine:
     """Google Translate wrapper with caching and batch support."""
 
-    def __init__(self, target_language: str = "vi"):
+    def __init__(self, target_language: str = "vi", source_language: str = "auto"):
         self._target_lang = target_language
+        self._source_lang = "auto"  # always use auto-detect regardless of source_language param
         self._translator = GoogleTranslator(source="auto", target=target_language)
         self._cache: dict[str, str] = {}
         self._lock = threading.Lock()

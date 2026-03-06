@@ -1,0 +1,129 @@
+=========================================
+MÔ TẢ KIẾN TRÚC ỨNG DỤNG SCREEN TRANSLATOR
+=========================================
+
+TỔNG QUAN
+---------
+Ứng dụng gồm 7 module chính hoạt động theo pipeline:
+
+  Hotkey → Toggle Overlay → [Timer] → Capture → OCR → Translate → Render
+
+
+CÁC MODULE
+----------
+
+1. main.py — Entry point + System Tray
+- Khởi tạo QApplication, system tray icon với menu (Bật/Tắt, Cài đặt, Thoát)
+- ScreenTranslatorApp: controller chính, load config, quản lý lifecycle
+- HotkeyEdit: widget capture phím tắt (click để ghi)
+- SettingsDialog: dialog cài đặt (hotkey, ngôn ngữ, chu kỳ)
+- Dùng pynput để lắng nghe global hotkey (không cần quyền admin)
+- Phím tắt mặc định: Ctrl+Shift+T → gọi _toggle_overlay()
+- QUIRK: Phải import torch trước PyQt6 để tránh xung đột DLL trên Windows (c10.dll)
+
+
+2. config.py — Cấu hình
+- Load/save settings.json
+- Default config:
+    hotkey               : ctrl+shift+t
+    capture_interval_ms  : 1500ms
+    source_language      : ko (Korean)
+    target_language      : vi (Vietnamese)
+    overlay_opacity      : 0.85
+
+
+3. capture.py — Chụp màn hình
+- Dùng mss (thư viện nhanh nhất cho screen capture)
+- ScreenCapture.capture_region(x, y, w, h): trả về np.ndarray (RGB)
+- capture_region_pil(): trả về PIL Image
+- Chuyển đổi BGRA → RGB qua PIL
+
+
+4. ocr_engine.py — OCR (multi-backend)
+Ưu tiên chọn backend theo thứ tự (nhanh → chậm):
+
+  [1] WinRT     — Nhanh nhất  — Cần Windows Language Pack
+  [2] RapidOCR  — Rất nhanh   — ONNX Runtime, CPU-only
+  [3] PaddleOCR — Trung bình  — Fallback
+  [4] EasyOCR   — Chậm nhất  — Cuối cùng
+
+- TextBlock: dataclass chứa text, bbox (4 góc), confidence
+- EasyOCR downscale ảnh 50% ([::2, ::2, :]) để tăng tốc
+- WinRT được kiểm tra qua subprocess riêng để tránh conflict với ONNX
+- OCREngine.set_source_language() sẽ chọn lại backend nếu đổi ngôn ngữ
+
+
+5. translator.py — Dịch thuật
+- Dùng deep_translator.GoogleTranslator (gọi Google Translate API miễn phí)
+- TranslationEngine có:
+    * In-memory dict cache (_cache) với threading.Lock
+    * translate_batch(): ghép nhiều text bằng " ||| " → gọi 1 API request
+      duy nhất (nếu tổng < 4500 ký tự)
+    * Fallback về dịch từng text nếu separator bị dịch sai
+- Source language mặc định là "auto" (Google tự detect)
+
+
+6. overlay.py — Cửa sổ overlay
+Cửa sổ trong suốt, frameless, luôn hiển thị trên top.
+
+  ┌─[Translator][WinRT] ✅ 3──────────────────[✕]┐
+  │                                               │
+  │  [Background trắng] Text dịch hiện ở đây      │
+  │                                               │
+  └────────────────────────────────────────────┘⌟
+
+Pipeline chạy theo QTimer (default 500ms):
+  1. _run_translation_cycle(): chụp vùng bên dưới overlay
+  2. Hash check (md5 trên ảnh downsampled 1/16): nếu ảnh không thay đổi → skip
+  3. Nếu thay đổi: setWindowOpacity(0) → chụp lại (tránh OCR đọc nhầm overlay)
+                   → setWindowOpacity(1)
+  4. Tạo TranslationWorker (QThread): chạy OCR + translate nền
+  5. result_ready signal → _on_translation_done() → update() (repaint)
+
+Tương tác chuột:
+  - Kéo title bar (24px trên cùng) → di chuyển
+  - Kéo cạnh/góc (4px border) → resize
+  - Click ✕ → hide()
+  - Escape → hide()
+
+
+7. renderer.py — Hiển thị text
+- TextRenderer.render(): nhận TextBlock[] + translated[] → vẽ lên QPainter
+- Gom nhóm thành paragraph: các block gần nhau theo chiều dọc
+  (<= 1.5× avg height) và có horizontal overlap → merge thành 1 đoạn
+- Auto font size: tính từ avg height của bbox (0.65 × avg_height),
+  sau đó shrink nếu text không vừa
+- Background mỗi paragraph: rgba(255,255,255,235) (gần trắng)
+
+
+LUỒNG HOẠT ĐỘNG ĐẦY ĐỦ
+------------------------
+
+  User nhấn Ctrl+Shift+T
+    → OverlayWindow.show()
+    → QTimer mỗi 500ms
+    → capture_region (mss)
+    → Hash giống lần trước? → YES → skip
+                             → NO  → setOpacity=0, chụp lại, setOpacity=1
+    → TranslationWorker (QThread)
+    → OCREngine.detect()
+        → WinRT / RapidOCR / PaddleOCR / EasyOCR
+    → TranslationEngine.translate_batch()
+        → Cached? → YES → trả cache
+                  → NO  → Google Translate API → lưu cache
+    → result_ready signal
+    → TextRenderer.render()
+    → Hiện text trên overlay
+
+
+CÁC ĐIỂM BOTTLENECK TIỀM NĂNG
+------------------------------
+
+  Điểm                  | Vấn đề                              | Gợi ý tối ưu
+  ----------------------|-------------------------------------|-----------------------------
+  OCR backend           | EasyOCR rất chậm (~800ms+)          | Đảm bảo WinRT/RapidOCR dùng
+  Google Translate       | Network latency ~200-500ms/call     | Cache tốt hơn / offline model
+  Opacity toggle         | 2 lần capture mỗi chu kỳ           | Dùng Windows Graphics Capture
+  Hash check             | MD5 trên byte array                 | Numpy array hash nhanh hơn
+  TranslationWorker      | Tạo QThread mới mỗi 500ms           | Thread pool / persistent worker
+  Batch separator        | " ||| " đôi khi bị dịch sai        | Unicode separator vô hình

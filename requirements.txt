@@ -1,7 +1,14 @@
 PyQt6>=6.5
 mss>=9.0
-keyboard>=0.13
+pynput>=0.13
 easyocr>=1.7
 deep-translator>=1.11
 Pillow>=10.0
 numpy>=1.24
+
+# optional accelerated/alternate OCR engines
+# install these if you plan to benchmark or use them; the code will
+# fall back gracefully when they are missing.
+winrt>=1.0              # Windows OCR API (requires language pack installed)
+rapidocr-onnxruntime>=0.4  # lightweight super-fast CPU OCR
+paddleocr>=2.7          # fallback engine (slower than rapid, faster than EasyOCR)

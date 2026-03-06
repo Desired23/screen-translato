@@ -1,5 +1,6 @@
 # renderer.py - Renders translated text on the overlay
-from PyQt6.QtCore import QRectF
+# Optimizations: binary-search font fit + LRU-like cache for font sizes
+from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QPainter, QFont, QColor, QFontMetrics, QPen, QBrush
 from ocr_engine import TextBlock
 
@@ -10,9 +11,9 @@ class TextRenderer:
     def __init__(
         self,
         font_family: str = "Segoe UI",
-        text_color: str = "#ffffff",
-        bg_color: str = "#1a1a2e",
-        font_size_min: int = 10,
+        text_color: str = "#000000",
+        bg_color: str = "#ffffff",
+        font_size_min: int = 6,
         font_size_max: int = 36,
     ):
         self._font_family = font_family
@@ -20,6 +21,61 @@ class TextRenderer:
         self._bg_color = QColor(bg_color)
         self._font_size_min = font_size_min
         self._font_size_max = font_size_max
+
+        # (text_hash, box_w_bucket, box_h_bucket) → pixel_size
+        # bucket size = 10px to increase hit rate across nearby sizes
+        self._font_cache: dict[tuple, int] = {}
+        self._CACHE_MAX = 500
+        self._CACHE_EVICT = 100
+
+    # ── Font fitting ──────────────────────────────────────────────────
+
+    def _fit_text_in_box(self, text: str, box_w: float, box_h: float) -> int:
+        """
+        Binary-search the largest pixel size where `text` fits inside
+        (box_w × box_h) with word-wrap. Result is cached.
+
+        Complexity: O(log N) binary search (~5 steps) vs O(N) linear (~24 steps).
+        Cache hit: O(1), skips search entirely.
+        """
+        if box_w <= 0 or box_h <= 0:
+            return self._font_size_min
+
+        # Cache key: (text hash, box dims rounded to 10px bucket)
+        key = (hash(text), int(box_w) // 10, int(box_h) // 10)
+        if key in self._font_cache:
+            return self._font_cache[key]
+
+        lo = self._font_size_min
+        hi = self._font_size_max
+        best = lo
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            font = QFont(self._font_family, -1)
+            font.setPixelSize(mid)
+            fm = QFontMetrics(font)
+            br = fm.boundingRect(
+                0, 0, int(box_w), 0,
+                Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft,
+                text,
+            )
+            if br.height() <= box_h and br.width() <= box_w:
+                best = mid    # fits → try bigger
+                lo = mid + 1
+            else:
+                hi = mid - 1  # doesn't fit → try smaller
+
+        # Store in cache (evict oldest entries when full)
+        if len(self._font_cache) >= self._CACHE_MAX:
+            oldest = list(self._font_cache.keys())[: self._CACHE_EVICT]
+            for k in oldest:
+                del self._font_cache[k]
+        self._font_cache[key] = best
+
+        return best
+
+    # ── Rendering ─────────────────────────────────────────────────────
 
     def render(
         self,
@@ -30,14 +86,12 @@ class TextRenderer:
         offset_y: int = 0,
     ):
         """
-        Render translated texts on the painter at the positions of original text blocks.
-        
-        Args:
-            painter: QPainter to draw on
-            text_blocks: Original OCR-detected text blocks
-            translated_texts: Corresponding translated texts
-            offset_x: X offset (for overlay positioning)
-            offset_y: Y offset (for overlay positioning, e.g. title bar height)
+        Render each translated text at its original block position.
+
+        Per block:
+          1. Compute rect from bbox + offset
+          2. Binary-search best font size (or hit cache)
+          3. Draw white background + centered black text
         """
         if not text_blocks or not translated_texts:
             return
@@ -45,58 +99,39 @@ class TextRenderer:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-        for block, translated in zip(text_blocks, translated_texts):
-            if not translated or not translated.strip():
+        PAD = 3
+
+        for block, trans_text in zip(text_blocks, translated_texts):
+            if not trans_text or not trans_text.strip():
                 continue
 
-            # Calculate draw rect from bounding box
-            rect = QRectF(
-                block.x + offset_x,
-                block.y + offset_y,
-                block.width,
-                block.height,
-            )
+            pts = block.bbox
+            bx = min(p[0] for p in pts) + offset_x
+            by = min(p[1] for p in pts) + offset_y
+            bw = max(p[0] for p in pts) - min(p[0] for p in pts)
+            bh = max(p[1] for p in pts) - min(p[1] for p in pts)
 
-            # Expand rect slightly for padding
-            padding = 3
-            rect = rect.adjusted(-padding, -padding, padding, padding)
+            if bw < 10 or bh < 8:
+                continue
 
-            # Calculate optimal font size to fit the text in the bounding box
-            font_size = self._calculate_font_size(translated, rect)
-            font = QFont(self._font_family, font_size)
-            font.setWeight(QFont.Weight.Medium)
+            rect = QRectF(bx - PAD, by - PAD, bw + PAD * 2, bh + PAD * 2)
 
-            # Draw background rectangle (to cover original text)
-            bg_color = QColor(self._bg_color)
-            bg_color.setAlpha(230)
-            painter.setPen(QPen(QColor(self._bg_color.darker(120)), 1))
-            painter.setBrush(QBrush(bg_color))
+            pixel_size = self._fit_text_in_box(trans_text, bw, bh)
+            font = QFont(self._font_family, -1)
+            font.setPixelSize(pixel_size)
+            font.setWeight(QFont.Weight.Normal)
+
+            # Background
+            bg = QColor(255, 255, 255, 235)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(bg))
             painter.drawRoundedRect(rect, 3, 3)
 
-            # Draw translated text
+            # Text
             painter.setFont(font)
-            painter.setPen(QPen(self._text_color))
+            painter.setPen(QPen(QColor(0, 0, 0)))
             painter.drawText(
-                rect.adjusted(padding, padding, -padding, -padding),
-                0x0001 | 0x0080 | 0x0100,  # AlignLeft | WordWrap | TextWordWrap
-                translated,
+                rect,
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                trans_text,
             )
-
-    def _calculate_font_size(self, text: str, rect: QRectF) -> int:
-        """Calculate the best font size to fit text within the bounding rectangle."""
-        target_height = rect.height() - 6  # padding
-
-        # Start with a size proportional to the height
-        best_size = max(self._font_size_min, min(int(target_height * 0.7), self._font_size_max))
-
-        # Try to fit within width
-        font = QFont(self._font_family, best_size)
-        metrics = QFontMetrics(font)
-        text_width = metrics.horizontalAdvance(text)
-
-        if text_width > rect.width() - 6:
-            # Scale down to fit width
-            ratio = (rect.width() - 6) / max(text_width, 1)
-            best_size = max(self._font_size_min, int(best_size * ratio))
-
-        return best_size

@@ -1,0 +1,19 @@
+{
+  "hotkey": "ctrl+shift+t",
+  "capture_interval_ms": 500,
+  "source_language": "ko",
+  "target_language": "vi",
+  "overlay_opacity": 0.85,
+  "font_family": "Segoe UI",
+  "font_size_min": 10,
+  "font_size_max": 36,
+  "background_color": "#ffffff",
+  "text_color": "#000000",
+  "border_color": "#000000",
+  "title_bar_color": "#1a1a2e",
+  "primary_backend": "winrt",
+  "fallback_backend": "rapidocr",
+  "confidence_thresh": 0.50,
+  "winrt_enabled": true,
+  "easyocr_enabled": false
+}

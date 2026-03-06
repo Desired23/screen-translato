@@ -1,8 +1,8 @@
 # overlay.py - Transparent overlay window with live translation
-import time
+import ctypes
 import traceback
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRect
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QCursor
 from PyQt6.QtWidgets import QWidget, QApplication
 
@@ -10,45 +10,9 @@ from capture import ScreenCapture
 from ocr_engine import OCREngine, TextBlock
 from translator import TranslationEngine
 from renderer import TextRenderer
+from async_pipeline import AsyncTranslationPipeline, PipelineResult
 from config import load_config
 
-
-class TranslationWorker(QThread):
-    """Background thread for OCR + translation to avoid blocking UI."""
-
-    result_ready = pyqtSignal(list, list)  # text_blocks, translated_texts
-
-    def __init__(self, ocr_engine: OCREngine, translator: TranslationEngine):
-        super().__init__()
-        self._ocr = ocr_engine
-        self._translator = translator
-        self._image: np.ndarray | None = None
-        self._running = True
-
-    def set_image(self, image: np.ndarray):
-        """Set the image to process."""
-        self._image = image
-
-    def run(self):
-        """Process the image: OCR → translate."""
-        if self._image is None:
-            return
-
-        try:
-            # OCR
-            blocks = self._ocr.detect(self._image)
-            if not blocks:
-                self.result_ready.emit([], [])
-                return
-
-            # Extract texts and batch translate
-            texts = [b.text for b in blocks]
-            translated = self._translator.translate_batch(texts)
-
-            self.result_ready.emit(blocks, translated)
-        except Exception:
-            traceback.print_exc()
-            self.result_ready.emit([], [])
 
 
 class OverlayWindow(QWidget):
@@ -60,8 +24,8 @@ class OverlayWindow(QWidget):
     - Runs OCR + translation loop on captured screen beneath
     """
 
-    TITLE_BAR_HEIGHT = 32
-    BORDER_WIDTH = 6
+    TITLE_BAR_HEIGHT = 24
+    BORDER_WIDTH = 4
     MIN_SIZE = 150
 
     def __init__(self, config: dict | None = None):
@@ -69,12 +33,16 @@ class OverlayWindow(QWidget):
 
         self._config = config or load_config()
         self._capture = ScreenCapture()
-        self._ocr = OCREngine()
-        self._translator = TranslationEngine(self._config.get("target_language", "vi"))
+        source_lang = self._config.get("source_language", "en")
+        self._ocr = OCREngine(source_language=source_lang, config=self._config)
+        self._translator = TranslationEngine(
+            target_language=self._config.get("target_language", "vi"),
+            source_language=source_lang,
+        )
         self._renderer = TextRenderer(
             font_family=self._config.get("font_family", "Segoe UI"),
-            text_color=self._config.get("text_color", "#ffffff"),
-            bg_color=self._config.get("background_color", "#1a1a2e"),
+            text_color=self._config.get("text_color", "#000000"),
+            bg_color=self._config.get("background_color", "#ffffff"),
             font_size_min=self._config.get("font_size_min", 10),
             font_size_max=self._config.get("font_size_max", 36),
         )
@@ -82,9 +50,23 @@ class OverlayWindow(QWidget):
         # Translation results
         self._text_blocks: list[TextBlock] = []
         self._translated_texts: list[str] = []
-        self._is_translating = False
-        self._worker: TranslationWorker | None = None
 
+        # Async pipeline (replaces TranslationWorker)
+        self._pipeline = AsyncTranslationPipeline(
+            ocr_engine=self._ocr,
+            translator=self._translator,
+            parent=self,
+        )
+        self._pipeline.result_ready.connect(self._on_result)
+        self._pipeline.pipeline_error.connect(
+            lambda msg: print(f"[Pipeline] Error: {msg}", flush=True)
+        )
+
+        # Whether the OS excludes our window from screen capture
+        # (set in showEvent — requires Win10 Build 2004+)
+        self._overlay_excluded: bool = False
+        # Last dirty-frame hash (with overlay visible) for Mode B dedup
+        self._last_dirty_hash: str = ""
         # Drag/resize state
         self._dragging = False
         self._resizing = False
@@ -94,6 +76,9 @@ class OverlayWindow(QWidget):
 
         self._setup_ui()
         self._setup_timer()
+        # Pre-warm OCR backends in a background thread so app starts quickly
+        import threading
+        threading.Thread(target=self._ocr.warm_up, daemon=True, name="ocr-warmup").start()
 
     def _setup_ui(self):
         """Configure the overlay window."""
@@ -120,17 +105,31 @@ class OverlayWindow(QWidget):
 
     def _setup_timer(self):
         """Set up the periodic translation timer."""
-        interval = self._config.get("capture_interval_ms", 1500)
+        interval = self._config.get("capture_interval_ms", 300)
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._run_translation_cycle)
+        self._timer.timeout.connect(self._on_tick)
         self._timer.setInterval(interval)
 
     def showEvent(self, event):
         """Start translation loop when shown."""
         super().showEvent(event)
         self._timer.start()
-        # Run first cycle immediately after a short delay
-        QTimer.singleShot(300, self._run_translation_cycle)
+        # Attempt to make this window invisible to screen-capture APIs
+        # (mss, BitBlt) while staying visible to the user.
+        # WDA_EXCLUDEFROMCAPTURE (0x11) requires Windows 10 Build 2004+.
+        # Check the return value — False means the call failed; we must
+        # fall back to the opacity-toggle approach to avoid a feedback loop
+        # where OCR reads its own translated output.
+        self._overlay_excluded = False
+        try:
+            hwnd = int(self.winId())
+            WDA_EXCLUDEFROMCAPTURE = 0x00000011
+            ok = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+            self._overlay_excluded = bool(ok)
+            print(f"[Capture] WDA_EXCLUDEFROMCAPTURE: {'OK — no opacity flicker' if self._overlay_excluded else 'FAILED — using opacity fallback'}", flush=True)
+        except Exception as e:
+            print(f"[Capture] WDA_EXCLUDEFROMCAPTURE unavailable: {e}", flush=True)
+        QTimer.singleShot(300, self._on_tick)
 
     def hideEvent(self, event):
         """Stop translation loop when hidden."""
@@ -142,60 +141,76 @@ class OverlayWindow(QWidget):
     def closeEvent(self, event):
         """Clean up resources."""
         self._timer.stop()
+        self._pipeline.shutdown()
         self._capture.close()
         super().closeEvent(event)
 
     # ─── Translation Pipeline ─────────────────────────────────────────
 
-    def _run_translation_cycle(self):
-        """One cycle: capture → OCR → translate → repaint."""
-        if self._is_translating or not self.isVisible():
+    def _on_tick(self):
+        """Capture → pipeline every timer tick (non-blocking).
+
+        Two modes depending on whether the OS excludes our window from capture:
+
+        A. _overlay_excluded=True  (Win10 2004+)
+           └─ Capture directly every tick. OS makes overlay invisible to mss,
+             so the image is always clean. pipeline.submit() deduplicates via hash.
+
+        B. _overlay_excluded=False (older Windows / API failure)
+           └─ Quick-capture WITH overlay visible, hash check first.
+             Only hide overlay when hash changed (content update), then
+             capture clean image and submit. This way flicker ONLY happens
+             on real content changes, never on static screens.
+        """
+        if not self.isVisible():
             return
 
-        self._is_translating = True
-
         try:
-            # Get overlay geometry (global screen coordinates)
             geo = self.geometry()
-            content_y = geo.y() + self.TITLE_BAR_HEIGHT
-            content_h = geo.height() - self.TITLE_BAR_HEIGHT
+            H_MARGIN = 4
+            BOTTOM_MARGIN = 20
+            cx = geo.x() + H_MARGIN
+            cy = geo.y() + self.TITLE_BAR_HEIGHT
+            cw = geo.width() - H_MARGIN * 2
+            ch = geo.height() - self.TITLE_BAR_HEIGHT - BOTTOM_MARGIN
 
-            if content_h <= 10 or geo.width() <= 10:
-                self._is_translating = False
+            if ch <= 10 or cw <= 10:
                 return
 
-            # Temporarily hide to capture what's beneath
-            self.setWindowOpacity(0)
-            QApplication.processEvents()
-            # Small delay to ensure the window is fully hidden
-            time.sleep(0.05)
+            if self._overlay_excluded:
+                # ── Mode A: direct capture, no flicker ever ────────────────
+                image = self._capture.capture_region(cx, cy, cw, ch)
+                self._pipeline.submit(image)  # deduped by hash inside
+            else:
+                # ── Mode B: hash check first, hide only on change ────────
+                # Capture with overlay visible — slightly dirty but fast.
+                # Compare dirty-to-dirty (not dirty-to-clean) to avoid a
+                # permanent mismatch loop when overlay text changes the image.
+                dirty = self._capture.capture_region(cx, cy, cw, ch)
+                dirty_hash = self._pipeline._fast_hash(dirty)
+                if dirty_hash == self._last_dirty_hash:
+                    return  # nothing changed — skip entirely, no flicker
 
-            # Capture the screen region
-            image = self._capture.capture_region(
-                geo.x(), content_y, geo.width(), content_h
-            )
+                self._last_dirty_hash = dirty_hash
 
-            # Show overlay again
-            self.setWindowOpacity(1.0)
-            QApplication.processEvents()
-
-            # Run OCR + translation in background thread
-            self._worker = TranslationWorker(self._ocr, self._translator)
-            self._worker.result_ready.connect(self._on_translation_done)
-            self._worker.set_image(image)
-            self._worker.start()
+                # Content changed — hide overlay to get a clean frame
+                self.setWindowOpacity(0)
+                QApplication.processEvents()
+                clean = self._capture.capture_region(cx, cy, cw, ch)
+                self.setWindowOpacity(1.0)
+                self._pipeline.submit(clean)
 
         except Exception:
             traceback.print_exc()
             self.setWindowOpacity(1.0)
-            self._is_translating = False
 
-    def _on_translation_done(self, blocks: list, translated: list):
-        """Handle translation results from worker thread."""
-        self._text_blocks = blocks
-        self._translated_texts = translated
-        self._is_translating = False
-        self.update()  # Trigger repaint
+    def _on_result(self, result: PipelineResult):
+        """Receive results from async pipeline and repaint."""
+        if result.elapsed_ms > 0:
+            print(f"[Perf] pipeline={result.elapsed_ms:.0f}ms  blocks={len(result.blocks)}", flush=True)
+        self._text_blocks = result.blocks
+        self._translated_texts = result.translated
+        self.update()
 
     # ─── Painting ─────────────────────────────────────────────────────
 
@@ -205,50 +220,53 @@ class OverlayWindow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         w, h = self.width(), self.height()
-        border_color = QColor(self._config.get("border_color", "#e94560"))
-        title_color = QColor(self._config.get("title_bar_color", "#16213e"))
 
-        # ── Title bar ──
+        # ── Title bar (compact, subtle) ──
         title_rect = QRect(0, 0, w, self.TITLE_BAR_HEIGHT)
-        title_bg = QColor(title_color)
-        title_bg.setAlpha(220)
+        title_bg = QColor("#1a1a2e")
+        title_bg.setAlpha(200)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(title_bg))
-        painter.drawRoundedRect(title_rect, 6, 6)
+        painter.drawRoundedRect(title_rect, 4, 4)
         # Square off bottom corners of title bar
-        painter.drawRect(QRect(0, self.TITLE_BAR_HEIGHT - 6, w, 6))
+        painter.drawRect(QRect(0, self.TITLE_BAR_HEIGHT - 4, w, 4))
 
-        # Title text
-        font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        # Title text — thin, small
+        font = QFont("Segoe UI", 8)
+        font.setWeight(QFont.Weight.Thin)
         painter.setFont(font)
-        painter.setPen(QPen(QColor("#ffffff")))
+        painter.setPen(QPen(QColor("#aaaaaa")))
 
-        status = "⏳ Đang dịch..." if self._is_translating else f"✅ {len(self._text_blocks)} khối text"
+        backend = getattr(self._ocr, "backend_name", "?")
+        is_busy = self._pipeline._worker.isRunning() and self._pipeline._worker._image is not None
+        status = "⏳" if is_busy else f"✅ {len(self._text_blocks)}"
         painter.drawText(
-            QRect(12, 0, w - 80, self.TITLE_BAR_HEIGHT),
+            QRect(8, 0, w - 50, self.TITLE_BAR_HEIGHT),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            f"🌐 Screen Translator  —  {status}",
+            f"Translator [{backend}]  {status}",
         )
 
-        # Close button
-        close_rect = QRect(w - 36, 4, 28, 24)
+        # Close button (small)
+        close_rect = QRect(w - 28, 3, 22, 18)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor("#e94560")))
-        painter.drawRoundedRect(close_rect, 4, 4)
-        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.setBrush(QBrush(QColor(200, 60, 60, 150)))
+        painter.drawRoundedRect(close_rect, 3, 3)
+        close_font = QFont("Segoe UI", 8)
+        painter.setFont(close_font)
+        painter.setPen(QPen(QColor("#ffffff")))
         painter.drawText(close_rect, Qt.AlignmentFlag.AlignCenter, "✕")
 
-        # ── Content area - semi-transparent background ──
+        # ── Content area - nearly transparent ──
         content_rect = QRect(0, self.TITLE_BAR_HEIGHT, w, h - self.TITLE_BAR_HEIGHT)
         content_bg = QColor(0, 0, 0, 1)  # Nearly transparent
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(content_bg))
         painter.drawRect(content_rect)
 
-        # ── Border ──
-        painter.setPen(QPen(border_color, 2))
+        # ── Border — white, thin ──
+        painter.setPen(QPen(QColor("#ffffff"), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(QRect(1, 1, w - 2, h - 2), 6, 6)
+        painter.drawRoundedRect(QRect(0, 0, w - 1, h - 1), 4, 4)
 
         # ── Render translated text ──
         if self._text_blocks and self._translated_texts:
@@ -260,15 +278,13 @@ class OverlayWindow(QWidget):
                 offset_y=self.TITLE_BAR_HEIGHT,
             )
 
-        # ── Resize handles (visual indicator) ──
-        handle_color = QColor(border_color)
-        handle_color.setAlpha(150)
+        # ── Resize handle (subtle) ──
+        handle_color = QColor(255, 255, 255, 80)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(handle_color))
-        # Bottom-right corner handle
-        painter.drawRect(QRect(w - 12, h - 12, 10, 3))
-        painter.drawRect(QRect(w - 12, h - 8, 10, 3))
-        painter.drawRect(QRect(w - 6, h - 12, 3, 10))
+        painter.drawRect(QRect(w - 10, h - 10, 8, 2))
+        painter.drawRect(QRect(w - 10, h - 6, 8, 2))
+        painter.drawRect(QRect(w - 4, h - 10, 2, 8))
 
         painter.end()
 
@@ -282,7 +298,7 @@ class OverlayWindow(QWidget):
         pos = event.pos()
 
         # Check close button
-        close_rect = QRect(self.width() - 36, 4, 28, 24)
+        close_rect = QRect(self.width() - 28, 3, 22, 18)
         if close_rect.contains(pos):
             self.hide()
             return
