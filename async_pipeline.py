@@ -234,17 +234,24 @@ class AsyncTranslationPipeline(QObject):
         self._worker.error.connect(self.pipeline_error)
         self._worker.start()
 
-        # Fast-hash to skip identical frames
-        self._last_hash: str = ""
+        # Fast-sample to skip identical frames
+        self._last_sample: np.ndarray | None = None
 
     # ── Public API ────────────────────────────────────────────────────
 
     def submit(self, image: np.ndarray):
-        """Non-blocking. Drops identical frames, cancels in-flight work."""
-        img_hash = self._fast_hash(image)
-        if img_hash == self._last_hash:
-            return
-        self._last_hash = img_hash
+        """Non-blocking. Drops similar frames, cancels in-flight work."""
+        img_sample = self._fast_sample(image)
+        if self._last_sample is not None:
+            try:
+                if img_sample.shape == self._last_sample.shape:
+                    mad = np.mean(np.abs(img_sample - self._last_sample))
+                    # 3.0 absolute difference threshold to ignore minor noise/tiny animations
+                    if mad < 3.0:
+                        return
+            except ValueError:
+                pass
+        self._last_sample = img_sample
         self._worker.submit(image)
 
     def shutdown(self):
@@ -256,7 +263,6 @@ class AsyncTranslationPipeline(QObject):
     # ── Helpers ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _fast_hash(img: np.ndarray) -> str:
-        """~0.1ms hash on 1/64 of pixels."""
-        sample = img[::8, ::8, 0]
-        return str(int(sample.sum()) ^ (int(sample[0, 0]) << 16))
+    def _fast_sample(img: np.ndarray) -> np.ndarray:
+        """~0.1ms downsample for rough image similarity check."""
+        return img[::8, ::8, 0].astype(np.float32)

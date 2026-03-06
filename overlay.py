@@ -1,7 +1,9 @@
 # overlay.py - Transparent overlay window with live translation
 import ctypes
+import ctypes.wintypes
 import traceback
 import numpy as np
+from PyQt6.sip import voidptr
 from PyQt6.QtCore import Qt, QTimer, QPoint, QRect
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QCursor
 from PyQt6.QtWidgets import QWidget, QApplication
@@ -13,6 +15,43 @@ from renderer import TextRenderer
 from async_pipeline import AsyncTranslationPipeline, PipelineResult
 from config import load_config
 
+
+
+class OverlayContentWindow(QWidget):
+    def __init__(self, parent_overlay):
+        super().__init__()
+        self._parent = parent_overlay
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def paintEvent(self, event):
+        if not self._parent._text_blocks or not self._parent._translated_texts:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = self.width(), self.height()
+        t = self._parent.TITLE_BAR_HEIGHT
+        
+        # Content background: nearly transparent to allow reading but keep click-through
+        content_rect = QRect(0, t, w, h - t)
+        painter.fillRect(content_rect, QColor(0, 0, 0, 1))
+
+        self._parent._renderer.render(
+            painter,
+            self._parent._text_blocks,
+            self._parent._translated_texts,
+            offset_x=0,
+            offset_y=t,
+        )
+        painter.end()
 
 
 class OverlayWindow(QWidget):
@@ -65,14 +104,17 @@ class OverlayWindow(QWidget):
         # Whether the OS excludes our window from screen capture
         # (set in showEvent — requires Win10 Build 2004+)
         self._overlay_excluded: bool = False
-        # Last dirty-frame hash (with overlay visible) for Mode B dedup
-        self._last_dirty_hash: str = ""
-        # Drag/resize state
-        self._dragging = False
-        self._resizing = False
-        self._resize_edge = None
-        self._drag_start = QPoint()
-        self._geometry_start = QRect()
+        # Last dirty-frame sample (with overlay visible) for Mode B dedup
+        self._last_dirty_sample: np.ndarray | None = None
+        # Note: Mouse dragging/resizing state handles are no longer needed
+        # Update: We now use a dual-window approach to prevent PyQt6 nativeEvent crashes 
+        # while keeping the center fully click-through and the borders resizable.
+        self._content = OverlayContentWindow(self)
+        self._drag_start: QPoint | None = None
+        self._resize_edge: str | None = None
+        
+        # Manual Capture / Freeze mode state
+        self._is_frozen: bool = False
 
         self._setup_ui()
         self._setup_timer()
@@ -113,37 +155,44 @@ class OverlayWindow(QWidget):
     def showEvent(self, event):
         """Start translation loop when shown."""
         super().showEvent(event)
+        if hasattr(self, "_content"):
+            self._content.setGeometry(self.geometry())
+            self._content.show()
         self._timer.start()
-        # Attempt to make this window invisible to screen-capture APIs
-        # (mss, BitBlt) while staying visible to the user.
-        # WDA_EXCLUDEFROMCAPTURE (0x11) requires Windows 10 Build 2004+.
-        # Check the return value — False means the call failed; we must
-        # fall back to the opacity-toggle approach to avoid a feedback loop
-        # where OCR reads its own translated output.
+        # We explicitly set `_overlay_excluded` to False and omit SetWindowDisplayAffinity.
+        # This allows screen capture tools (OBS, ShareX) to see the translated text.
+        # The app will naturally fall back to "Mode B: opacity toggle" to prevent self-reading.
         self._overlay_excluded = False
-        try:
-            hwnd = int(self.winId())
-            WDA_EXCLUDEFROMCAPTURE = 0x00000011
-            ok = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
-            self._overlay_excluded = bool(ok)
-            print(f"[Capture] WDA_EXCLUDEFROMCAPTURE: {'OK — no opacity flicker' if self._overlay_excluded else 'FAILED — using opacity fallback'}", flush=True)
-        except Exception as e:
-            print(f"[Capture] WDA_EXCLUDEFROMCAPTURE unavailable: {e}", flush=True)
+        print("[Capture] Screen capture visibility enabled — using opacity fallback for OCR", flush=True)
         QTimer.singleShot(300, self._on_tick)
 
     def hideEvent(self, event):
         """Stop translation loop when hidden."""
         super().hideEvent(event)
+        if hasattr(self, "_content"):
+            self._content.hide()
         self._timer.stop()
         self._text_blocks = []
         self._translated_texts = []
 
     def closeEvent(self, event):
         """Clean up resources."""
+        if hasattr(self, "_content"):
+            self._content.close()
         self._timer.stop()
         self._pipeline.shutdown()
         self._capture.close()
         super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_content"):
+            self._content.setGeometry(self.geometry())
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if hasattr(self, "_content"):
+            self._content.setGeometry(self.geometry())
 
     # ─── Translation Pipeline ─────────────────────────────────────────
 
@@ -163,6 +212,9 @@ class OverlayWindow(QWidget):
              on real content changes, never on static screens.
         """
         if not self.isVisible():
+            return
+
+        if self._is_frozen:
             return
 
         try:
@@ -187,11 +239,17 @@ class OverlayWindow(QWidget):
                 # Compare dirty-to-dirty (not dirty-to-clean) to avoid a
                 # permanent mismatch loop when overlay text changes the image.
                 dirty = self._capture.capture_region(cx, cy, cw, ch)
-                dirty_hash = self._pipeline._fast_hash(dirty)
-                if dirty_hash == self._last_dirty_hash:
-                    return  # nothing changed — skip entirely, no flicker
+                dirty_sample = self._pipeline._fast_sample(dirty)
+                if self._last_dirty_sample is not None:
+                    try:
+                        if dirty_sample.shape == self._last_dirty_sample.shape:
+                            mad = np.mean(np.abs(dirty_sample - self._last_dirty_sample))
+                            if mad < 3.0: # 3.0 threshold for minor noise/animation
+                                return  # nothing changed — skip entirely, no flicker
+                    except ValueError:
+                        pass
 
-                self._last_dirty_hash = dirty_hash
+                self._last_dirty_sample = dirty_sample
 
                 # Content changed — hide overlay to get a clean frame
                 self.setWindowOpacity(0)
@@ -210,7 +268,13 @@ class OverlayWindow(QWidget):
             print(f"[Perf] pipeline={result.elapsed_ms:.0f}ms  blocks={len(result.blocks)}", flush=True)
         self._text_blocks = result.blocks
         self._translated_texts = result.translated
+        
+        # Ensure overlay is visible even if we previously hid it in Mode B
+        self.setWindowOpacity(1.0)
+        
         self.update()
+        if hasattr(self, "_content"):
+            self._content.update()
 
     # ─── Painting ─────────────────────────────────────────────────────
 
@@ -246,7 +310,24 @@ class OverlayWindow(QWidget):
             f"Translator [{backend}]  {status}",
         )
 
-        # Close button (small)
+        # ── Toggle Freeze Button ──
+        # Placed to the left of the close button
+        freeze_rect = QRect(w - 56, 3, 22, 18)
+        painter.setBrush(QBrush(QColor(100, 150, 255, 150) if self._is_frozen else QColor(100, 100, 100, 100)))
+        painter.drawRoundedRect(freeze_rect, 3, 3)
+        painter.setPen(QPen(QColor("#ffffff")))
+        freeze_icon = "▶" if self._is_frozen else "⏸"
+        painter.drawText(freeze_rect, Qt.AlignmentFlag.AlignCenter, freeze_icon)
+        
+        # ── Refresh Button ──
+        # Placed to the left of the freeze button
+        refresh_rect = QRect(w - 84, 3, 22, 18)
+        painter.setBrush(QBrush(QColor(100, 100, 100, 100)))
+        painter.drawRoundedRect(refresh_rect, 3, 3)
+        painter.setPen(QPen(QColor("#ffffff")))
+        painter.drawText(refresh_rect, Qt.AlignmentFlag.AlignCenter, "🔄")
+
+        # ── Close button (small) ──
         close_rect = QRect(w - 28, 3, 22, 18)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(200, 60, 60, 150)))
@@ -256,27 +337,10 @@ class OverlayWindow(QWidget):
         painter.setPen(QPen(QColor("#ffffff")))
         painter.drawText(close_rect, Qt.AlignmentFlag.AlignCenter, "✕")
 
-        # ── Content area - nearly transparent ──
-        content_rect = QRect(0, self.TITLE_BAR_HEIGHT, w, h - self.TITLE_BAR_HEIGHT)
-        content_bg = QColor(0, 0, 0, 1)  # Nearly transparent
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(content_bg))
-        painter.drawRect(content_rect)
-
         # ── Border — white, thin ──
         painter.setPen(QPen(QColor("#ffffff"), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(QRect(0, 0, w - 1, h - 1), 4, 4)
-
-        # ── Render translated text ──
-        if self._text_blocks and self._translated_texts:
-            self._renderer.render(
-                painter,
-                self._text_blocks,
-                self._translated_texts,
-                offset_x=0,
-                offset_y=self.TITLE_BAR_HEIGHT,
-            )
 
         # ── Resize handle (subtle) ──
         handle_color = QColor(255, 255, 255, 80)
@@ -291,117 +355,104 @@ class OverlayWindow(QWidget):
     # ─── Mouse Interaction ────────────────────────────────────────────
 
     def mousePressEvent(self, event):
-        """Handle mouse press for dragging and resizing."""
+        """Handle mouse press inside the client area."""
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        pos = event.pos()
+        x, y = event.pos().x(), event.pos().y()
+        w, h = self.width(), self.height()
+        b = self.BORDER_WIDTH
+        t = self.TITLE_BAR_HEIGHT
 
-        # Check close button
-        close_rect = QRect(self.width() - 28, 3, 22, 18)
-        if close_rect.contains(pos):
+        close_rect = QRect(w - 28, 3, 22, 18)
+        if close_rect.contains(event.pos()):
             self.hide()
             return
-
-        # Check if on resize edge
-        edge = self._get_resize_edge(pos)
-        if edge:
-            self._resizing = True
-            self._resize_edge = edge
-            self._drag_start = event.globalPosition().toPoint()
-            self._geometry_start = self.geometry()
+            
+        freeze_rect = QRect(w - 56, 3, 22, 18)
+        if freeze_rect.contains(event.pos()):
+            self._is_frozen = not self._is_frozen
+            self.update()
+            
+            # If we just initiated a freeze, we force one immediate capture to lock the current frame
+            if self._is_frozen:
+                # Bypass the 'is_frozen' check temporarily to grab the exact moment they clicked 'freeze'
+                self._is_frozen = False
+                self._on_tick() # This will submit the current frame to the pipeline
+                self._is_frozen = True # Re-engage freeze mode immediately
+                
+            return
+            
+        refresh_rect = QRect(w - 84, 3, 22, 18)
+        if refresh_rect.contains(event.pos()):
+            # Clear text blocks and force a scan
+            self._text_blocks = []
+            self._translated_texts = []
+            
+            # Briefly disable freeze to allow the tick to process
+            was_frozen = self._is_frozen
+            self._is_frozen = False
+            self._on_tick() # Forces an immediate capture and submit
+            self._is_frozen = was_frozen
+            
+            self.update()
+            if hasattr(self, "_content"):
+                self._content.update()
             return
 
-        # Check if on title bar (drag area)
-        if pos.y() <= self.TITLE_BAR_HEIGHT:
-            self._dragging = True
-            self._drag_start = event.globalPosition().toPoint()
-            self._geometry_start = self.geometry()
+        self._drag_start = event.globalPosition().toPoint()
+        self._start_geo = self.geometry()
+
+        on_left = x <= b
+        on_right = x >= w - b
+        on_top = y <= b
+        on_bottom = y >= h - b
+
+        if on_top and on_left: self._resize_edge = "top_left"
+        elif on_top and on_right: self._resize_edge = "top_right"
+        elif on_bottom and on_left: self._resize_edge = "bottom_left"
+        elif on_bottom and on_right: self._resize_edge = "bottom_right"
+        elif on_left: self._resize_edge = "left"
+        elif on_right: self._resize_edge = "right"
+        elif on_bottom: self._resize_edge = "bottom"
+        elif y <= t: self._resize_edge = "title"
+        else: self._resize_edge = None
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move for dragging and resizing."""
-        pos = event.pos()
+        x, y = event.pos().x(), event.pos().y()
+        w, h = self.width(), self.height()
+        b = self.BORDER_WIDTH
 
-        if self._dragging:
-            delta = event.globalPosition().toPoint() - self._drag_start
-            self.move(self._geometry_start.topLeft() + delta)
-            return
+        if not getattr(self, "_resize_edge", None):
+            if x <= b and y <= b: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif x >= w - b and y >= h - b: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif x >= w - b and y <= b: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif x <= b and y >= h - b: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif x <= b or x >= w - b: self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif y <= b or y >= h - b: self.setCursor(Qt.CursorShape.SizeVerCursor)
+            else: self.setCursor(Qt.CursorShape.ArrowCursor)
 
-        if self._resizing:
-            delta = event.globalPosition().toPoint() - self._drag_start
-            geo = QRect(self._geometry_start)
-
-            if "right" in self._resize_edge:
-                geo.setWidth(max(self.MIN_SIZE, self._geometry_start.width() + delta.x()))
-            if "bottom" in self._resize_edge:
-                geo.setHeight(max(self.MIN_SIZE, self._geometry_start.height() + delta.y()))
-            if "left" in self._resize_edge:
-                new_left = self._geometry_start.left() + delta.x()
-                new_width = self._geometry_start.width() - delta.x()
-                if new_width >= self.MIN_SIZE:
-                    geo.setLeft(new_left)
-            if "top" in self._resize_edge:
-                new_top = self._geometry_start.top() + delta.y()
-                new_height = self._geometry_start.height() - delta.y()
-                if new_height >= self.MIN_SIZE:
-                    geo.setTop(new_top)
-
-            self.setGeometry(geo)
-            return
-
-        # Update cursor based on hover position
-        edge = self._get_resize_edge(pos)
-        if edge:
-            cursors = {
-                "right": Qt.CursorShape.SizeHorCursor,
-                "left": Qt.CursorShape.SizeHorCursor,
-                "bottom": Qt.CursorShape.SizeVerCursor,
-                "top": Qt.CursorShape.SizeVerCursor,
-                "bottom-right": Qt.CursorShape.SizeFDiagCursor,
-                "top-left": Qt.CursorShape.SizeFDiagCursor,
-                "bottom-left": Qt.CursorShape.SizeBDiagCursor,
-                "top-right": Qt.CursorShape.SizeBDiagCursor,
-            }
-            self.setCursor(cursors.get(edge, Qt.CursorShape.ArrowCursor))
-        elif pos.y() <= self.TITLE_BAR_HEIGHT:
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if getattr(self, "_drag_start", None) and self._resize_edge:
+            d = event.globalPosition().toPoint() - self._drag_start
+            g = self._start_geo
+            if self._resize_edge == "title":
+                self.move(g.topLeft() + d)
+            elif isinstance(self._resize_edge, str):
+                new_g = QRect(g)
+                if "left" in self._resize_edge:
+                    new_g.setLeft(min(g.left() + d.x(), g.right() - self.MIN_SIZE))
+                if "right" in self._resize_edge:
+                    new_g.setRight(max(g.right() + d.x(), g.left() + self.MIN_SIZE))
+                if "top" in self._resize_edge:
+                    new_g.setTop(min(g.top() + d.y(), g.bottom() - self.MIN_SIZE))
+                if "bottom" in self._resize_edge:
+                    new_g.setBottom(max(g.bottom() + d.y(), g.top() + self.MIN_SIZE))
+                self.setGeometry(new_g)
 
     def mouseReleaseEvent(self, event):
-        """Handle mouse release."""
-        self._dragging = False
-        self._resizing = False
+        self._drag_start = None
         self._resize_edge = None
-
-    def _get_resize_edge(self, pos: QPoint) -> str | None:
-        """Determine which resize edge the mouse is near."""
-        b = self.BORDER_WIDTH
-        w, h = self.width(), self.height()
-
-        on_left = pos.x() <= b
-        on_right = pos.x() >= w - b
-        on_top = pos.y() <= b
-        on_bottom = pos.y() >= h - b
-
-        if on_bottom and on_right:
-            return "bottom-right"
-        if on_bottom and on_left:
-            return "bottom-left"
-        if on_top and on_right:
-            return "top-right"
-        if on_top and on_left:
-            return "top-left"
-        if on_right:
-            return "right"
-        if on_left:
-            return "left"
-        if on_bottom:
-            return "bottom"
-        if on_top and pos.y() > self.TITLE_BAR_HEIGHT:
-            return "top"
-
-        return None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def keyPressEvent(self, event):
         """Handle key presses."""

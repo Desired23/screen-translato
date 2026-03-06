@@ -473,13 +473,16 @@ class ScreenTranslatorApp:
 
             hotkey = self._config.get("hotkey", "ctrl+shift+t")
             self._target_keys = self._parse_hotkey(hotkey)
+            self._freeze_keys = self._parse_hotkey("ctrl+shift+m")
             self._pressed_keys = set()
 
             def on_press(key):
                 self._pressed_keys.add(key)
                 # Normalize: check both left/right modifiers
-                if self._check_hotkey_match():
+                if self._check_hotkey_match(self._target_keys):
                     QTimer.singleShot(0, self._toggle_overlay)
+                elif self._check_hotkey_match(self._freeze_keys):
+                    QTimer.singleShot(0, self._toggle_freeze)
 
             def on_release(key):
                 self._pressed_keys.discard(key)
@@ -494,9 +497,9 @@ class ScreenTranslatorApp:
         except Exception as e:
             print(f"[Hotkey] Failed to register: {e}", flush=True)
 
-    def _check_hotkey_match(self) -> bool:
+    def _check_hotkey_match(self, target_keys: set) -> bool:
         """Check if currently pressed keys match the target hotkey."""
-        for target in self._target_keys:
+        for target in target_keys:
             matched = False
             for pressed in self._pressed_keys:
                 if target == pressed:
@@ -532,6 +535,17 @@ class ScreenTranslatorApp:
         else:
             self._overlay.show()
             self._overlay.activateWindow()
+
+    def _toggle_freeze(self):
+        """Toggle freeze/manual mode on the active overlay."""
+        if self._overlay and self._overlay.isVisible():
+            self._overlay._is_frozen = not self._overlay._is_frozen
+            self._overlay.update()
+            
+            if self._overlay._is_frozen:
+                self._overlay._is_frozen = False
+                self._overlay._on_tick()
+                self._overlay._is_frozen = True
 
     def _show_settings(self):
         """Show settings dialog."""

@@ -87,11 +87,7 @@ class TextRenderer:
     ):
         """
         Render each translated text at its original block position.
-
-        Per block:
-          1. Compute rect from bbox + offset
-          2. Binary-search best font size (or hit cache)
-          3. Draw white background + centered black text
+        Optimized with overlap resolution and content height auto-sizing.
         """
         if not text_blocks or not translated_texts:
             return
@@ -99,8 +95,15 @@ class TextRenderer:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-        PAD = 3
+        # We use MARGIN to prevent overlap, no internal PAD needed anymore
+        PAD = 0
+        MARGIN = 4
+        MIN_READABLE_FONT = 13  # Minimum font size for readability
+        MIN_BOX_WIDTH = 40      # Minimum width to prevent tall skinny boxes
 
+        target_items = []
+
+        # 1. Compute target rects and font sizes
         for block, trans_text in zip(text_blocks, translated_texts):
             if not trans_text or not trans_text.strip():
                 continue
@@ -114,18 +117,66 @@ class TextRenderer:
             if bw < 10 or bh < 8:
                 continue
 
-            rect = QRectF(bx - PAD, by - PAD, bw + PAD * 2, bh + PAD * 2)
+            # Ensure minimal readability for width
+            bw = max(bw, MIN_BOX_WIDTH)
 
-            pixel_size = self._fit_text_in_box(trans_text, bw, bh)
+            # Fit text but clamp to MIN_READABLE_FONT
+            pixel_size = max(MIN_READABLE_FONT, self._fit_text_in_box(trans_text, bw, bh))
+
             font = QFont(self._font_family, -1)
             font.setPixelSize(pixel_size)
             font.setWeight(QFont.Weight.Normal)
 
+            # Recalculate actual height needed with this font
+            fm = QFontMetrics(font)
+            br = fm.boundingRect(
+                0, 0, int(bw), 0,
+                Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft,
+                trans_text
+            )
+
+            # Actual bounding box needed (with padding)
+            needed_h = max(bh, br.height())
+            rect = QRectF(bx - PAD, by - PAD, bw + PAD * 2, needed_h + PAD * 2)
+
+            target_items.append({
+                "rect": rect,
+                "text": trans_text,
+                "font": font
+            })
+
+        # 2. Sort top-to-bottom
+        target_items.sort(key=lambda item: item["rect"].y())
+
+        # 3. Resolve overlaps
+        for i in range(len(target_items)):
+            while True:
+                collided = False
+                r_i = target_items[i]["rect"]
+                for j in range(i):
+                    r_j = target_items[j]["rect"]
+                    # Add margin around r_j for separation
+                    r_j_margin = r_j.adjusted(-MARGIN, -MARGIN, MARGIN, MARGIN)
+
+                    if r_i.intersects(r_j_margin):
+                        # Push r_i down just below r_j_margin
+                        push_down = r_j_margin.bottom() - r_i.top()
+                        r_i.translate(0, push_down)
+                        collided = True
+                if not collided:
+                    break
+
+        # 4. Draw
+        for item in target_items:
+            rect = item["rect"]
+            font = item["font"]
+            trans_text = item["text"]
+
             # Background
-            bg = QColor(255, 255, 255, 235)
+            bg = QColor(255, 255, 255, 240)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(bg))
-            painter.drawRoundedRect(rect, 3, 3)
+            painter.drawRoundedRect(rect, 4, 4)
 
             # Text
             painter.setFont(font)
