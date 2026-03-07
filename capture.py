@@ -30,9 +30,12 @@ class ScreenCapture:
             "height": height,
         }
         screenshot = self._sct.grab(monitor)
-        # Convert BGRA to RGB numpy array
-        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-        return np.array(img)
+        # Convert BGRA -> RGB directly from mss buffer (faster than PIL roundtrip).
+        bgra = np.frombuffer(screenshot.bgra, dtype=np.uint8).reshape(
+            screenshot.height, screenshot.width, 4
+        )
+        rgb_view = bgra[:, :, :3][:, :, ::-1]
+        return np.ascontiguousarray(rgb_view)
 
     def capture_region_pil(self, x: int, y: int, width: int, height: int) -> Image.Image:
         """Capture a screen region and return as PIL Image."""

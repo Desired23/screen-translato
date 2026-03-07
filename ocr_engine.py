@@ -110,39 +110,217 @@ def _merge_group(group: list["TextBlock"]) -> "TextBlock":
 
 
 def merge_same_line_blocks(blocks: list["TextBlock"]) -> list["TextBlock"]:
-    """Merge OCR blocks that share the same visual line — O(n log n).
-
-    Algorithm:
-    1. Sort blocks by center_y  → O(n log n)
-    2. Single linear pass: compare each block only to the *last* block in
-       the current group → O(n)
-    Total: O(n log n) vs the previous O(n²) nested-loop approach.
-    """
+    """Merge OCR fragments on the same text line without cross-bubble over-merge."""
     if not blocks:
         return blocks
 
     avg_h = sum(b.height for b in blocks) / len(blocks)
-    threshold = avg_h * 0.5
+    y_threshold = max(4.0, avg_h * 0.45)
 
-    # Sort once — avoids the O(n²) nested comparison
-    sorted_blocks = sorted(blocks, key=lambda b: b.center_y)
-
-    lines: list[TextBlock] = []
-    current_group: list[TextBlock] = [sorted_blocks[0]]
+    # Step 1: cluster roughly by vertical position.
+    sorted_blocks = sorted(blocks, key=lambda b: (b.center_y, b.x))
+    row_candidates: list[list[TextBlock]] = []
+    current_row: list[TextBlock] = [sorted_blocks[0]]
+    current_center = sorted_blocks[0].center_y
 
     for block in sorted_blocks[1:]:
-        # Compare only against the anchor (first block of current group)
-        if abs(block.center_y - current_group[0].center_y) <= threshold:
-            current_group.append(block)
+        if abs(block.center_y - current_center) <= y_threshold:
+            current_row.append(block)
+            current_center = (
+                (current_center * (len(current_row) - 1)) + block.center_y
+            ) / len(current_row)
         else:
-            lines.append(_merge_group(current_group))
-            current_group = [block]
+            row_candidates.append(current_row)
+            current_row = [block]
+            current_center = block.center_y
+    row_candidates.append(current_row)
 
-    lines.append(_merge_group(current_group))
+    # Step 2: inside each row, split by large horizontal gaps to avoid merging
+    # speech bubbles that happen to be on the same y-level.
+    lines: list[TextBlock] = []
+    for row in row_candidates:
+        row_sorted = sorted(row, key=lambda b: b.x)
+        group = [row_sorted[0]]
+        for block in row_sorted[1:]:
+            prev = group[-1]
+            prev_right = prev.x + prev.width
+            gap = block.x - prev_right
+            avg_char_w = (
+                (prev.width / max(len(prev.text), 1))
+                + (block.width / max(len(block.text), 1))
+            ) / 2.0
+            gap_limit = max(40.0, avg_char_w * 6.0, min(prev.height, block.height) * 2.2)
+            local_y_threshold = max(3.0, min(prev.height, block.height) * 0.5)
 
-    # Re-sort merged lines top-to-bottom
+            if abs(block.center_y - prev.center_y) <= local_y_threshold and gap <= gap_limit:
+                group.append(block)
+            else:
+                lines.append(_merge_group(group))
+                group = [block]
+        lines.append(_merge_group(group))
+
     lines.sort(key=lambda b: b.y)
     return lines
+
+
+def _horizontal_overlap_ratio(a: "TextBlock", b: "TextBlock") -> float:
+    ax1, ax2 = a.x, a.x + a.width
+    bx1, bx2 = b.x, b.x + b.width
+    overlap = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    denom = max(1.0, min(a.width, b.width))
+    return overlap / denom
+
+
+def _join_paragraph_text(parts: list[str]) -> str:
+    out: list[str] = []
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        if not out:
+            out.append(p)
+            continue
+        if p[0] in ",.!?;:)":
+            out[-1] = out[-1] + p
+        elif out[-1].endswith(("-", "/")):
+            out[-1] = out[-1] + p
+        else:
+            out.append(p)
+    return " ".join(out)
+
+
+def _merge_paragraph_group(group: list["TextBlock"]) -> "TextBlock":
+    group_sorted = sorted(group, key=lambda b: (b.y, b.x))
+    text = _join_paragraph_text([g.text for g in group_sorted])
+    all_x = [p[0] for g in group_sorted for p in g.bbox]
+    all_y = [p[1] for g in group_sorted for p in g.bbox]
+    return TextBlock(
+        text=text,
+        bbox=[
+            [min(all_x), min(all_y)],
+            [max(all_x), min(all_y)],
+            [max(all_x), max(all_y)],
+            [min(all_x), max(all_y)],
+        ],
+        confidence=min(g.confidence for g in group_sorted),
+    )
+
+
+def merge_paragraph_blocks(
+    blocks: list["TextBlock"],
+    max_lines_per_group: int = 4,
+    min_overlap_ratio: float = 0.35,
+    center_distance_factor: float = 0.55,
+    max_width_expand_ratio: float = 1.8,
+) -> list["TextBlock"]:
+    """Merge lines inside the same speech bubble, avoiding cross-bubble chain merge."""
+    if not blocks:
+        return blocks
+
+    def rect_overlap_ratio(l1: float, r1: float, l2: float, r2: float) -> float:
+        overlap = max(0.0, min(r1, r2) - max(l1, l2))
+        denom = max(1.0, min(r1 - l1, r2 - l2))
+        return overlap / denom
+
+    ordered = sorted(blocks, key=lambda b: (b.y, b.x))
+    groups: list[dict] = []
+
+    for block in ordered:
+        b_left = float(block.x)
+        b_top = float(block.y)
+        b_right = float(block.x + block.width)
+        b_bottom = float(block.y + block.height)
+        b_center_x = (b_left + b_right) / 2.0
+
+        best_idx: int | None = None
+        best_score = -1e9
+
+        for idx, g in enumerate(groups):
+            if len(g["blocks"]) >= max_lines_per_group:
+                continue
+
+            avg_h = g["avg_h"]
+            v_gap = b_top - g["bottom"]
+
+            # Keep lines vertically close (with slight overlap tolerance).
+            if v_gap > max(8.0, avg_h * 0.95):
+                continue
+            if v_gap < -max(6.0, avg_h * 0.8):
+                continue
+
+            overlap = rect_overlap_ratio(g["left"], g["right"], b_left, b_right)
+            center_dist = abs(b_center_x - g["center_x"])
+            center_limit = max(20.0, min(g["width"], block.width) * center_distance_factor)
+
+            # Either overlap enough OR remain near the same horizontal center.
+            if overlap < min_overlap_ratio and center_dist > center_limit:
+                continue
+
+            # Prevent group width from exploding across unrelated bubbles.
+            merged_left = min(g["left"], b_left)
+            merged_right = max(g["right"], b_right)
+            merged_width = merged_right - merged_left
+            if merged_width > max(g["width"], block.width) * max_width_expand_ratio:
+                continue
+
+            score = (overlap * 2.2) - (max(v_gap, 0.0) / max(avg_h, 1.0)) - (center_dist / max(center_limit, 1.0))
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is None:
+            groups.append(
+                {
+                    "blocks": [block],
+                    "left": b_left,
+                    "right": b_right,
+                    "top": b_top,
+                    "bottom": b_bottom,
+                    "width": b_right - b_left,
+                    "center_x": b_center_x,
+                    "avg_h": float(block.height),
+                }
+            )
+            continue
+
+        g = groups[best_idx]
+        g["blocks"].append(block)
+        g["left"] = min(g["left"], b_left)
+        g["right"] = max(g["right"], b_right)
+        g["top"] = min(g["top"], b_top)
+        g["bottom"] = max(g["bottom"], b_bottom)
+        g["width"] = g["right"] - g["left"]
+        g["center_x"] = (g["left"] + g["right"]) / 2.0
+        g["avg_h"] = sum(b.height for b in g["blocks"]) / len(g["blocks"])
+
+    merged = [_merge_paragraph_group(g["blocks"]) for g in groups if g["blocks"]]
+    merged.sort(key=lambda b: (b.y, b.x))
+    if not merged:
+        return merged
+
+    # Post-pass: merge orphan tails/connectors back to previous block.
+    stitched: list[TextBlock] = [merged[0]]
+    connectors = {"a", "an", "the", "of", "with", "and", "or", "to"}
+    for block in merged[1:]:
+        prev = stitched[-1]
+        v_gap = block.y - (prev.y + prev.height)
+        overlap = _horizontal_overlap_ratio(prev, block)
+        short_block = len(block.text.strip()) <= 14 or len(block.text.split()) <= 2
+
+        tail = prev.text.strip().lower().rstrip(".,!?;:")
+        tail_word = tail.split()[-1] if tail.split() else ""
+        connector_tail = (
+            tail_word in connectors
+            or tail.endswith("alongwitha")
+            or tail.endswith("along with a")
+        )
+
+        if v_gap <= max(10.0, prev.height * 1.1) and overlap >= 0.25 and (short_block or connector_tail):
+            stitched[-1] = _merge_paragraph_group([prev, block])
+        else:
+            stitched.append(block)
+
+    return stitched
 
 
 class _EasyOCREngine(_BaseEngine):
@@ -262,15 +440,27 @@ class _WinRTEngine(_BaseEngine):
         img_bytes = pil.convert("RGBA").tobytes()
         w, h = pil.size
         writer = self._streams.DataWriter()
-        writer.write_bytes(list(img_bytes))
+        # winrt bindings differ by version: prefer bytes-like, fallback to list[int]
+        try:
+            writer.write_bytes(img_bytes)
+        except TypeError:
+            writer.write_bytes(list(img_bytes))
         buf = writer.detach_buffer()
-        bitmap = self._imaging.SoftwareBitmap.create_copy_from_buffer(
-            buf,
-            self._imaging.BitmapPixelFormat.RGBA8,
-            w,
-            h,
-            self._imaging.BitmapAlphaMode.PREMULTIPLIED,
-        )
+        try:
+            bitmap = self._imaging.SoftwareBitmap.create_copy_from_buffer(
+                buf,
+                self._imaging.BitmapPixelFormat.RGBA8,
+                w,
+                h,
+                self._imaging.BitmapAlphaMode.PREMULTIPLIED,
+            )
+        except TypeError:
+            bitmap = self._imaging.SoftwareBitmap.create_copy_from_buffer(
+                buf,
+                self._imaging.BitmapPixelFormat.RGBA8,
+                w,
+                h,
+            )
         # the recognize_async method is awaitable
         async def _recognize():
             return await self._engine.recognize_async(bitmap)
@@ -292,9 +482,13 @@ class _WinRTEngine(_BaseEngine):
 class _RapidEngine(_BaseEngine):
     """OCR via rapidocr-onnxruntime wrapper. Much faster than EasyOCR on CPU."""
 
-    def __init__(self, lang: str):
+    def __init__(self, lang: str, config: dict | None = None):
         self._lang = lang
+        self._config = config or {}
         self._rapid = None
+        self._quality_retry_enabled = bool(self._config.get("rapid_quality_retry", False))
+        self._joined_ratio_threshold = float(self._config.get("rapid_joined_ratio_threshold", 0.35))
+        self._quality_score_margin = float(self._config.get("rapid_quality_margin", 0.03))
         try:
             from rapidocr_onnxruntime import RapidOCR
             self._rapid = RapidOCR()
@@ -303,31 +497,142 @@ class _RapidEngine(_BaseEngine):
             msg = str(e)
             print(f"[OCR] RapidOCR unavailable: {msg}", flush=True)
             if "DLL load failed" in msg:
-                print("[OCR]  * ONNX Runtime failure – try reinstalling cpu-only or matching GPU runtime.", flush=True)
+                print("[OCR]  * ONNX Runtime failure - try reinstalling cpu-only or matching GPU runtime.", flush=True)
 
-    def detect(self, image: np.ndarray, min_confidence: float = 0.20) -> list[TextBlock]:
-        if self._rapid is None:
-            return []
+    @staticmethod
+    def _token_is_joined(text: str) -> bool:
+        token = text.strip()
+        if " " in token:
+            return False
+        letters = [c for c in token if c.isalpha()]
+        if len(letters) < 6:
+            return False
+        upper_ratio = sum(1 for c in letters if c.isupper()) / max(len(letters), 1)
+        return upper_ratio >= 0.8
+
+    def _needs_quality_retry(self, blocks: list[TextBlock]) -> bool:
+        if not blocks:
+            return True
+        joined = sum(1 for b in blocks if self._token_is_joined(b.text))
+        joined_ratio = joined / len(blocks)
+        avg_conf = _avg_confidence(blocks)
+        return joined_ratio >= self._joined_ratio_threshold or (avg_conf < 0.55 and len(blocks) <= 5)
+
+    def _quality_score(self, blocks: list[TextBlock]) -> float:
+        if not blocks:
+            return -1.0
+        avg_conf = _avg_confidence(blocks)
+        joined = sum(1 for b in blocks if self._token_is_joined(b.text))
+        spaced = sum(1 for b in blocks if " " in b.text.strip())
+        return (avg_conf * 1.2) + (len(blocks) * 0.015) + (spaced * 0.02) - (joined * 0.05)
+
+    @staticmethod
+    def _is_reasonable_candidate(candidate: list[TextBlock], baseline: list[TextBlock]) -> bool:
+        """Reject quality-pass candidates that collapse detection too aggressively."""
+        if not baseline:
+            return True
+        if not candidate:
+            return False
+        if len(baseline) <= 6:
+            return True
+        min_allowed = max(3, int(len(baseline) * 0.45))
+        return len(candidate) >= min_allowed
+
+    @staticmethod
+    def _prepare_manga_image(image: np.ndarray) -> np.ndarray:
+        """High-contrast preprocessing to suppress manga halftone noise."""
+        from PIL import Image, ImageFilter
+
+        if image.ndim == 2:
+            gray = image.astype(np.uint8)
+        else:
+            gray = np.dot(image[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
+
+        p10, p90 = np.percentile(gray, [10, 90])
+        if p90 - p10 < 8:
+            norm = gray
+        else:
+            norm = np.clip((gray - p10) * 255.0 / (p90 - p10), 0, 255).astype(np.uint8)
+
+        thr = np.percentile(norm, 58)
+        bw = np.where(norm > thr, 255, 0).astype(np.uint8)
+
+        # Median filter removes dot-pattern noise while preserving glyph strokes.
+        bw = np.array(Image.fromarray(bw, mode="L").filter(ImageFilter.MedianFilter(size=3)))
+        return np.stack([bw, bw, bw], axis=-1)
+
+    @staticmethod
+    def _upscale_for_small_text(image: np.ndarray, scale: float = 1.35) -> tuple[np.ndarray, float]:
+        from PIL import Image
+
+        h, w = image.shape[:2]
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        # Avoid explosive cost on very large images.
+        if new_w * new_h > 2_800_000:
+            return image, 1.0
+        resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+        up = Image.fromarray(image).resize((new_w, new_h), resample=resample)
+        return np.array(up), scale
+
+    def _detect_once(
+        self,
+        image: np.ndarray,
+        min_confidence: float,
+        coord_scale: float = 1.0,
+    ) -> list[TextBlock]:
         try:
             results = self._rapid(image)
         except Exception as e:
             print(f"[OCR] RapidOCR error: {e}", flush=True)
             return []
+
         blocks: list[TextBlock] = []
-        # rapid returns list with [boxes, txts, confidences] per page
         if results and results[0]:
             for box, text, conf in results[0]:
-                # confidence may occasionally be returned as a string
                 try:
                     conf_val = float(conf)
                 except Exception:
                     conf_val = 0.0
                 if conf_val >= min_confidence and text.strip():
-                    # box is 4x2 array
-                    bbox = [[float(x), float(y)] for x, y in box]
+                    bbox = [[float(x) * coord_scale, float(y) * coord_scale] for x, y in box]
                     blocks.append(TextBlock(text=text.strip(), bbox=bbox, confidence=conf_val))
         blocks.sort(key=lambda b: (b.y, b.x))
         return blocks
+
+    def detect(self, image: np.ndarray, min_confidence: float = 0.20) -> list[TextBlock]:
+        if self._rapid is None:
+            return []
+
+        base = self._detect_once(image, min_confidence=min_confidence, coord_scale=1.0)
+        if not self._quality_retry_enabled or not self._needs_quality_retry(base):
+            return base
+
+        best = base
+        best_score = self._quality_score(base)
+
+        enhanced_img = self._prepare_manga_image(image)
+        enhanced = self._detect_once(enhanced_img, min_confidence=min_confidence, coord_scale=1.0)
+        enhanced_score = self._quality_score(enhanced)
+        if self._is_reasonable_candidate(enhanced, base) and enhanced_score > best_score + self._quality_score_margin:
+            best = enhanced
+            best_score = enhanced_score
+            print("[OCR] RapidOCR quality pass: using enhanced image", flush=True)
+
+        if self._needs_quality_retry(best):
+            up_img, scale = self._upscale_for_small_text(image)
+            if scale > 1.0:
+                upscaled = self._detect_once(
+                    up_img,
+                    min_confidence=min_confidence,
+                    coord_scale=1.0 / scale,
+                )
+                up_score = self._quality_score(upscaled)
+                if self._is_reasonable_candidate(upscaled, base) and up_score > best_score + self._quality_score_margin:
+                    best = upscaled
+                    print(f"[OCR] RapidOCR quality pass: using upscaled image x{scale:.2f}", flush=True)
+
+        return best
 
 
 class _PaddleEngine(_BaseEngine):
@@ -426,10 +731,10 @@ def _avg_confidence(blocks: list[TextBlock]) -> float:
     return sum(b.confidence for b in blocks) / len(blocks)
 
 
-def _make_engine(name: str, lang: str) -> "_BaseEngine | None":
+def _make_engine(name: str, lang: str, config: dict | None = None) -> "_BaseEngine | None":
     """Instantiate and return a backend engine by name, or None if unavailable."""
     if name == BACKEND_RAPIDOCR:
-        e = _RapidEngine(lang)
+        e = _RapidEngine(lang, config=config)
         return e if e._rapid is not None else None
     if name == BACKEND_PADDLEOCR:
         e = _PaddleEngine(lang)
@@ -502,7 +807,7 @@ class OCREngine:
             wanted_fallback = BACKEND_NONE
 
         # ── Load primary ──────────────────────────────────────────────
-        engine = _make_engine(wanted_primary, self._source_language)
+        engine = _make_engine(wanted_primary, self._source_language, self._config)
         if engine is not None:
             self._primary      = engine
             self._primary_name = wanted_primary
@@ -519,7 +824,7 @@ class OCREngine:
             for name in cascade:
                 if name == wanted_primary:
                     continue  # already tried
-                e = _make_engine(name, self._source_language)
+                e = _make_engine(name, self._source_language, self._config)
                 if e is not None:
                     self._primary      = e
                     self._primary_name = name
@@ -531,7 +836,7 @@ class OCREngine:
                 and wanted_fallback != BACKEND_NONE
                 and wanted_fallback != BACKEND_PADDLEOCR   # skip broken paddle
                 and wanted_fallback != self._primary_name):
-            fe = _make_engine(wanted_fallback, self._source_language)
+            fe = _make_engine(wanted_fallback, self._source_language, self._config)
             if fe is not None:
                 self._fallback      = fe
                 self._fallback_name = wanted_fallback

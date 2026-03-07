@@ -1,4 +1,4 @@
-# main.py - Entry point with system tray and global hotkey
+﻿# main.py - Entry point with system tray and global hotkey
 import sys
 
 # IMPORTANT: Import torch BEFORE PyQt6 to avoid DLL conflict on Windows
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QGroupBox,
     QMessageBox,
+    QScrollArea,
     QWidget,
 )
 
@@ -37,38 +38,36 @@ from overlay import OverlayWindow
 # Source languages (for OCR - what's on screen)
 SOURCE_LANGUAGES = {
     "en": "English",
-    "ko": "한국어",
-    "ja": "日本語",
-    "zh-CN": "中文 (简体)",
-    "zh-TW": "中文 (繁體)",
-    "fr": "Français",
-    "de": "Deutsch",
-    "es": "Español",
-    "th": "ไทย",
-    "ru": "Русский",
-    "pt": "Português",
-    "it": "Italiano",
-    "ar": "العربية",
+    "ko": "Korean",
+    "ja": "Japanese",
+    "zh-CN": "Chinese (Simplified)",
+    "zh-TW": "Chinese (Traditional)",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "th": "Thai",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "ar": "Arabic",
 }
-
 # Target languages (translation output)
 TARGET_LANGUAGES = {
-    "vi": "Tiếng Việt",
+    "vi": "Vietnamese",
     "en": "English",
-    "ja": "日本語",
-    "ko": "한국어",
-    "zh-CN": "中文 (简体)",
-    "zh-TW": "中文 (繁體)",
-    "fr": "Français",
-    "de": "Deutsch",
-    "es": "Español",
-    "th": "ไทย",
-    "ru": "Русский",
-    "pt": "Português",
-    "it": "Italiano",
-    "ar": "العربية",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "zh-CN": "Chinese (Simplified)",
+    "zh-TW": "Chinese (Traditional)",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "th": "Thai",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "ar": "Arabic",
 }
-
 
 class HotkeyEdit(QLineEdit):
     """A line edit that captures keyboard shortcuts."""
@@ -76,7 +75,7 @@ class HotkeyEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
-        self.setPlaceholderText("Nhấn phím tắt...")
+        self.setPlaceholderText("Press hotkey...")
         self.setStyleSheet("""
             QLineEdit {
                 background: #2a2a4a;
@@ -96,7 +95,7 @@ class HotkeyEdit(QLineEdit):
     def mousePressEvent(self, event):
         """Start recording on click."""
         self._recording = True
-        self.setText("⌨ Đang ghi phím...")
+        self.setText("Recording...")
         self.setStyleSheet(self.styleSheet().replace("#e94560", "#00d2ff"))
         super().mousePressEvent(event)
 
@@ -138,12 +137,19 @@ class SettingsDialog(QDialog):
         self._setup_ui()
 
     def _setup_ui(self):
-        self.setWindowTitle("⚙ Cài đặt Screen Translator")
-        self.setFixedSize(420, 480)
+        self.setWindowTitle("Settings - Screen Translator")
+        self.resize(480, 760)
+        self.setMinimumSize(440, 680)
         self.setStyleSheet("""
             QDialog {
                 background: #0f0f23;
                 color: #ffffff;
+            }
+            QScrollArea#settingsScrollArea,
+            QWidget#settingsScrollViewport,
+            QWidget#settingsScrollContent {
+                background: #0f0f23;
+                border: none;
             }
             QGroupBox {
                 font-weight: bold;
@@ -163,13 +169,16 @@ class SettingsDialog(QDialog):
                 color: #cccccc;
                 font-size: 12px;
             }
-            QComboBox, QSpinBox {
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
                 background: #1a1a2e;
                 border: 1px solid #2a2a4a;
                 border-radius: 6px;
                 color: #ffffff;
                 padding: 6px 10px;
                 min-height: 28px;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border-color: #00d2ff;
             }
             QComboBox::drop-down {
                 border: none;
@@ -180,6 +189,21 @@ class SettingsDialog(QDialog):
                 color: #ffffff;
                 selection-background-color: #e94560;
             }
+            QCheckBox {
+                color: #d8d8d8;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid #2a2a4a;
+                background: #1a1a2e;
+            }
+            QCheckBox::indicator:checked {
+                background: #e94560;
+                border-color: #e94560;
+            }
             QPushButton {
                 border-radius: 6px;
                 padding: 10px 24px;
@@ -189,23 +213,36 @@ class SettingsDialog(QDialog):
             }
         """)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(14, 14, 14, 14)
+        outer_layout.setSpacing(12)
 
-        # ── Hotkey group ──
-        hotkey_group = QGroupBox("⌨ Phím tắt")
+        scroll = QScrollArea(self)
+        scroll.setObjectName("settingsScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_content = QWidget()
+        scroll_content.setObjectName("settingsScrollContent")
+        scroll.viewport().setObjectName("settingsScrollViewport")
+        layout = QVBoxLayout(scroll_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        scroll.setWidget(scroll_content)
+        outer_layout.addWidget(scroll, 1)
+
+        hotkey_group = QGroupBox("Hotkey")
         hk_layout = QVBoxLayout(hotkey_group)
-        hk_layout.addWidget(QLabel("Click vào ô rồi nhấn tổ hợp phím mong muốn:"))
+        hk_layout.addWidget(QLabel("Click the box and press your desired hotkey:"))
         self._hotkey_edit = HotkeyEdit()
         self._hotkey_edit.setText(self._config.get("hotkey", "ctrl+shift+t"))
         hk_layout.addWidget(self._hotkey_edit)
         layout.addWidget(hotkey_group)
 
-        # ── Language group ──
-        lang_group = QGroupBox("🌐 Ngôn ngữ")
+        lang_group = QGroupBox("Language")
         ll = QVBoxLayout(lang_group)
 
-        ll.addWidget(QLabel("Ngôn ngữ gốc (trên màn hình):"))
+        ll.addWidget(QLabel("Source language (on screen):"))
         self._source_lang_combo = QComboBox()
         for code, name in SOURCE_LANGUAGES.items():
             self._source_lang_combo.addItem(f"{name} ({code})", code)
@@ -215,7 +252,7 @@ class SettingsDialog(QDialog):
             self._source_lang_combo.setCurrentIndex(idx)
         ll.addWidget(self._source_lang_combo)
 
-        ll.addWidget(QLabel("Ngôn ngữ dịch sang:"))
+        ll.addWidget(QLabel("Target language:"))
         self._target_lang_combo = QComboBox()
         for code, name in TARGET_LANGUAGES.items():
             self._target_lang_combo.addItem(f"{name} ({code})", code)
@@ -225,13 +262,103 @@ class SettingsDialog(QDialog):
             self._target_lang_combo.setCurrentIndex(idx)
         ll.addWidget(self._target_lang_combo)
 
+        ll.addWidget(QLabel("Translation backend:"))
+        self._translation_backend_combo = QComboBox()
+        self._translation_backend_combo.addItem("Auto (NLLB -> Argos -> Google)", "auto")
+        self._translation_backend_combo.addItem("NLLB (Offline)", "nllb")
+        self._translation_backend_combo.addItem("Google (Online)", "google")
+        self._translation_backend_combo.addItem("Argos (Offline)", "argos")
+        current_backend = self._config.get("translation_backend", "auto")
+        idx = self._translation_backend_combo.findData(current_backend)
+        if idx >= 0:
+            self._translation_backend_combo.setCurrentIndex(idx)
+        ll.addWidget(self._translation_backend_combo)
+
+        self._translation_fallback_cb = QCheckBox("Allow fallback to Google if primary backend fails")
+        self._translation_fallback_cb.setChecked(
+            bool(self._config.get("translation_fallback_to_google", True))
+        )
+        ll.addWidget(self._translation_fallback_cb)
+
+        ll.addWidget(QLabel("Argos pivot language:"))
+        self._argos_pivot_combo = QComboBox()
+        self._argos_pivot_combo.addItem("English (en)", "en")
+        self._argos_pivot_combo.addItem("Japanese (ja)", "ja")
+        self._argos_pivot_combo.addItem("Korean (ko)", "ko")
+        self._argos_pivot_combo.addItem("Chinese (zh)", "zh")
+        current_pivot = self._config.get("argos_pivot_language", "en")
+        idx = self._argos_pivot_combo.findData(current_pivot)
+        if idx >= 0:
+            self._argos_pivot_combo.setCurrentIndex(idx)
+        ll.addWidget(self._argos_pivot_combo)
+
+        self._context_refine_cb = QCheckBox("Context refine for short bubbles")
+        self._context_refine_cb.setChecked(
+            bool(self._config.get("translation_context_refine_enabled", True))
+        )
+        ll.addWidget(self._context_refine_cb)
+
+        ll.addWidget(QLabel("Context refine max chars:"))
+        self._context_max_chars_spin = QSpinBox()
+        self._context_max_chars_spin.setRange(16, 120)
+        self._context_max_chars_spin.setSingleStep(4)
+        self._context_max_chars_spin.setValue(
+            int(self._config.get("translation_context_refine_max_chars", 48))
+        )
+        ll.addWidget(self._context_max_chars_spin)
+
+        ll.addWidget(QLabel("Context refine max words:"))
+        self._context_max_words_spin = QSpinBox()
+        self._context_max_words_spin.setRange(3, 20)
+        self._context_max_words_spin.setSingleStep(1)
+        self._context_max_words_spin.setValue(
+            int(self._config.get("translation_context_refine_max_words", 10))
+        )
+        ll.addWidget(self._context_max_words_spin)
+
+        ll.addWidget(QLabel("Context refine max blocks per frame:"))
+        self._context_max_per_batch_spin = QSpinBox()
+        self._context_max_per_batch_spin.setRange(0, 12)
+        self._context_max_per_batch_spin.setSingleStep(1)
+        self._context_max_per_batch_spin.setValue(
+            int(self._config.get("translation_context_refine_max_per_batch", 1))
+        )
+        ll.addWidget(self._context_max_per_batch_spin)
+
+        self._game_term_guard_cb = QCheckBox("Preserve game terms (Basic Attack, Resonance Skill, ...)")
+        self._game_term_guard_cb.setChecked(
+            bool(self._config.get("translation_game_term_guard_enabled", True))
+        )
+        ll.addWidget(self._game_term_guard_cb)
+
+        self._game_post_edit_cb = QCheckBox("Game post-edit (fix cast/dealing wording)")
+        self._game_post_edit_cb.setChecked(
+            bool(self._config.get("translation_game_post_edit_enabled", True))
+        )
+        ll.addWidget(self._game_post_edit_cb)
+
+        self._auto_source_routing_cb = QCheckBox(
+            "Auto source routing by script (EN/JA/KO/ZH)"
+        )
+        self._auto_source_routing_cb.setChecked(
+            bool(self._config.get("translation_auto_source_routing_enabled", True))
+        )
+        ll.addWidget(self._auto_source_routing_cb)
+
+        self._semantic_cache_cb = QCheckBox(
+            "Semantic cache for near-identical OCR lines"
+        )
+        self._semantic_cache_cb.setChecked(
+            bool(self._config.get("translation_semantic_cache_enabled", True))
+        )
+        ll.addWidget(self._semantic_cache_cb)
+
         layout.addWidget(lang_group)
 
-        # ── Settings group ──
-        settings_group = QGroupBox("⚙ Cài đặt")
+        settings_group = QGroupBox("Runtime")
         sl = QVBoxLayout(settings_group)
 
-        sl.addWidget(QLabel("Chu kỳ dịch (ms):"))
+        sl.addWidget(QLabel("Capture interval (ms):"))
         self._interval_spin = QSpinBox()
         self._interval_spin.setRange(500, 5000)
         self._interval_spin.setSingleStep(100)
@@ -239,10 +366,45 @@ class SettingsDialog(QDialog):
         self._interval_spin.setSuffix(" ms")
         sl.addWidget(self._interval_spin)
 
+        self._drop_frames_busy_cb = QCheckBox("Drop new frames while pipeline is busy")
+        self._drop_frames_busy_cb.setChecked(
+            bool(self._config.get("drop_frames_when_busy", True))
+        )
+        sl.addWidget(self._drop_frames_busy_cb)
+
+        self._auto_ui_line_mode_cb = QCheckBox("Auto UI/Game mode: force line-level merge")
+        self._auto_ui_line_mode_cb.setChecked(
+            bool(self._config.get("auto_ui_line_mode_enabled", True))
+        )
+        sl.addWidget(self._auto_ui_line_mode_cb)
+
+        self._ui_panel_merge_cb = QCheckBox("UI/Game panel merge (keep related lines together)")
+        self._ui_panel_merge_cb.setChecked(
+            bool(self._config.get("ui_panel_merge_enabled", True))
+        )
+        sl.addWidget(self._ui_panel_merge_cb)
+
+        self._auto_document_line_mode_cb = QCheckBox("Auto document mode: keep line-level blocks")
+        self._auto_document_line_mode_cb.setChecked(
+            bool(self._config.get("auto_document_line_mode_enabled", True))
+        )
+        sl.addWidget(self._auto_document_line_mode_cb)
+
+        self._document_paragraph_cb = QCheckBox("Document mode: translate by paragraph")
+        self._document_paragraph_cb.setChecked(
+            bool(self._config.get("auto_document_translate_by_paragraph", True))
+        )
+        sl.addWidget(self._document_paragraph_cb)
+
+        self._dark_ui_retry_cb = QCheckBox("Dark UI OCR retry (better yellow/bright text)")
+        self._dark_ui_retry_cb.setChecked(
+            bool(self._config.get("ocr_dark_ui_retry_enabled", True))
+        )
+        sl.addWidget(self._dark_ui_retry_cb)
+
         layout.addWidget(settings_group)
 
-        # ── OCR Engine group ──
-        ocr_group = QGroupBox("🔍 OCR Engine")
+        ocr_group = QGroupBox("OCR")
         ocr_group.setStyleSheet("""
             QCheckBox {
                 color: #cccccc;
@@ -263,47 +425,44 @@ class SettingsDialog(QDialog):
         """)
         ol = QVBoxLayout(ocr_group)
 
-        # Info label
         info_row = QHBoxLayout()
-        info_label = QLabel("Primary: RapidOCR  →  Fallback: PaddleOCR")
+        info_label = QLabel("Primary: RapidOCR -> Fallback: PaddleOCR")
         info_label.setStyleSheet("color: #00d2ff; font-size: 11px; font-style: italic;")
         info_row.addWidget(info_label)
         ol.addLayout(info_row)
 
-        # Confidence threshold
-        ol.addWidget(QLabel("Ngưỡng confidence fallback (0.60 → 0.95):"))
+        ol.addWidget(QLabel("Fallback confidence threshold (0.60 -> 0.95):"))
         self._conf_spin = QDoubleSpinBox()
         self._conf_spin.setRange(0.60, 0.95)
         self._conf_spin.setSingleStep(0.05)
         self._conf_spin.setDecimals(2)
         self._conf_spin.setValue(self._config.get("confidence_thresh", 0.75))
         self._conf_spin.setToolTip(
-            "Nếu avg confidence của RapidOCR < ngưỡng này → chạy PaddleOCR"
+            "If RapidOCR average confidence < threshold -> run PaddleOCR"
         )
         ol.addWidget(self._conf_spin)
 
-        # Checkbox: WinRT
-        self._winrt_cb = QCheckBox("Bật WinRT OCR (chỉ EN và một số ngôn ngữ có Language Pack)")
+        self._winrt_cb = QCheckBox("Enable WinRT OCR (requires Windows language packs)")
         self._winrt_cb.setChecked(bool(self._config.get("winrt_enabled", False)))
         self._winrt_cb.setToolTip(
-            "WinRT rất nhanh nhưng accuracy thấp với CJK. Tắt mặc định."
+            "WinRT is very fast but may be less accurate for CJK text."
         )
         ol.addWidget(self._winrt_cb)
 
-        # Checkbox: EasyOCR
-        self._easyocr_cb = QCheckBox("Bật EasyOCR (ngôn ngữ hiếm: Thai, Arabic, v.v.)")
+        self._easyocr_cb = QCheckBox("Enable EasyOCR (rare languages, slower)")
         self._easyocr_cb.setChecked(bool(self._config.get("easyocr_enabled", False)))
         self._easyocr_cb.setToolTip(
-            "EasyOCR chậm (~800ms) nhưng hỗ trợ nhiều ngôn ngữ nhất. Chỉ bật khi cần."
+            "EasyOCR is slower but supports many languages."
         )
         ol.addWidget(self._easyocr_cb)
 
         layout.addWidget(ocr_group)
+        layout.addStretch(1)
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        cancel_btn = QPushButton("Hủy")
+        cancel_btn = QPushButton("Cancel")
         cancel_btn.setStyleSheet("""
             QPushButton {
                 background: #2a2a4a;
@@ -315,7 +474,7 @@ class SettingsDialog(QDialog):
         """)
         cancel_btn.clicked.connect(self.reject)
 
-        save_btn = QPushButton("💾 Lưu")
+        save_btn = QPushButton("Save")
         save_btn.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -331,14 +490,32 @@ class SettingsDialog(QDialog):
 
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(save_btn)
-        layout.addLayout(btn_layout)
-
+        outer_layout.addLayout(btn_layout)
     def _save(self):
         """Save settings and close."""
         self._config["hotkey"] = self._hotkey_edit.text()
         self._config["source_language"] = self._source_lang_combo.currentData()
         self._config["target_language"] = self._target_lang_combo.currentData()
+        self._config["translation_backend"] = self._translation_backend_combo.currentData()
+        self._config["translation_fallback_to_google"] = self._translation_fallback_cb.isChecked()
+        self._config["argos_pivot_language"] = self._argos_pivot_combo.currentData()
+        self._config["translation_context_refine_enabled"] = self._context_refine_cb.isChecked()
+        self._config["translation_context_refine_max_chars"] = self._context_max_chars_spin.value()
+        self._config["translation_context_refine_max_words"] = self._context_max_words_spin.value()
+        self._config["translation_context_refine_max_per_batch"] = self._context_max_per_batch_spin.value()
+        self._config["translation_game_term_guard_enabled"] = self._game_term_guard_cb.isChecked()
+        self._config["translation_game_post_edit_enabled"] = self._game_post_edit_cb.isChecked()
+        self._config["translation_auto_source_routing_enabled"] = (
+            self._auto_source_routing_cb.isChecked()
+        )
+        self._config["translation_semantic_cache_enabled"] = self._semantic_cache_cb.isChecked()
         self._config["capture_interval_ms"] = self._interval_spin.value()
+        self._config["drop_frames_when_busy"] = self._drop_frames_busy_cb.isChecked()
+        self._config["auto_ui_line_mode_enabled"] = self._auto_ui_line_mode_cb.isChecked()
+        self._config["ui_panel_merge_enabled"] = self._ui_panel_merge_cb.isChecked()
+        self._config["auto_document_line_mode_enabled"] = self._auto_document_line_mode_cb.isChecked()
+        self._config["auto_document_translate_by_paragraph"] = self._document_paragraph_cb.isChecked()
+        self._config["ocr_dark_ui_retry_enabled"] = self._dark_ui_retry_cb.isChecked()
         self._config["confidence_thresh"] = self._conf_spin.value()
         self._config["winrt_enabled"] = self._winrt_cb.isChecked()
         self._config["easyocr_enabled"] = self._easyocr_cb.isChecked()
@@ -412,13 +589,13 @@ class ScreenTranslatorApp:
             }
         """)
 
-        toggle_action = QAction(f"🌐 Bật/Tắt Overlay ({self._config['hotkey']})", self._app)
+        toggle_action = QAction(f"Toggle Overlay ({self._config['hotkey']})", self._app)
         toggle_action.triggered.connect(self._toggle_overlay)
 
-        settings_action = QAction("⚙ Cài đặt", self._app)
+        settings_action = QAction("Settings", self._app)
         settings_action.triggered.connect(self._show_settings)
 
-        quit_action = QAction("❌ Thoát", self._app)
+        quit_action = QAction("Quit", self._app)
         quit_action.triggered.connect(self._quit)
 
         menu.addAction(toggle_action)
@@ -428,14 +605,14 @@ class ScreenTranslatorApp:
         menu.addAction(quit_action)
 
         self._tray.setContextMenu(menu)
-        self._tray.setToolTip("Screen Translator - Nhấn " + self._config["hotkey"])
+        self._tray.setToolTip("Screen Translator - Press " + self._config["hotkey"])
         self._tray.activated.connect(lambda _reason: self._toggle_overlay())
         self._tray.show()
 
         # Show notification
         self._tray.showMessage(
             "Screen Translator",
-            f"Ứng dụng đang chạy! Nhấn {self._config['hotkey']} để bật overlay dịch.",
+            f"App is running. Press {self._config['hotkey']} to toggle overlay.",
             QSystemTrayIcon.MessageIcon.Information,
             3000,
         )
@@ -605,3 +782,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
