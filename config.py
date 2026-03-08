@@ -1,8 +1,28 @@
 # config.py - Application configuration
 import json
 import os
+import sys
+from pathlib import Path
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+APP_NAME = "ScreenTranslator"
+
+
+def _get_config_file() -> Path:
+    """Resolve settings.json location.
+
+    - Development mode: keep settings next to source files for convenience.
+    - Frozen/release mode: store settings under %APPDATA%\\ScreenTranslator.
+    """
+    if getattr(sys, "frozen", False):
+        appdata = os.getenv("APPDATA") or str(Path.home())
+        config_dir = Path(appdata) / APP_NAME
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir / "settings.json"
+    return Path(__file__).resolve().parent / "settings.json"
+
+
+CONFIG_FILE = _get_config_file()
 
 DEFAULT_CONFIG = {
     "hotkey": "ctrl+shift+t",
@@ -107,9 +127,9 @@ DEFAULT_CONFIG = {
 def load_config() -> dict:
     """Load config from file, falling back to defaults."""
     config = DEFAULT_CONFIG.copy()
-    if os.path.exists(CONFIG_FILE):
+    if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
                 saved = json.load(f)
                 config.update(saved)
         except (json.JSONDecodeError, IOError):
@@ -120,7 +140,8 @@ def load_config() -> dict:
 def save_config(config: dict):
     """Save config to file."""
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with CONFIG_FILE.open("w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
     except IOError:
         pass
