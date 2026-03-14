@@ -1,6 +1,8 @@
 param(
     [string]$Python = "python",
     [string]$Version = "0.1.0",
+    [ValidateSet("full", "lite")]
+    [string]$Flavor = "full",
     [switch]$Clean,
     [switch]$SkipToolInstall,
     [switch]$SkipInstaller
@@ -13,6 +15,7 @@ $repoRoot = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 Set-Location $repoRoot
 
 Write-Host "==> Repo root: $repoRoot"
+Write-Host "==> Flavor: $Flavor"
 
 if ($Clean) {
     Write-Host "==> Cleaning build artifacts"
@@ -27,14 +30,50 @@ if (-not $SkipToolInstall) {
     if ($LASTEXITCODE -ne 0) {
         Write-Host "==> Installing packaging tools"
         & $Python -m pip install --disable-pip-version-check --upgrade pip pyinstaller
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install packaging tools."
+        }
     }
 }
 
 Write-Host "==> Building executable with PyInstaller"
-& $Python -m PyInstaller --noconfirm "$repoRoot\screen_translator.spec"
+$specPath = if ($Flavor -eq "full") {
+    Join-Path $repoRoot "screen_translator_full.spec"
+} else {
+    Join-Path $repoRoot "screen_translator.spec"
+}
+& $Python -m PyInstaller --noconfirm $specPath
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller build failed."
+}
+
+if ($Flavor -eq "full") {
+    $modelSrc = Join-Path $repoRoot ".models"
+    $modelDstDist = Join-Path $repoRoot "dist\ScreenTranslator\.models"
+    if (Test-Path $modelSrc) {
+        Write-Host "==> Copying offline models into dist bundle"
+        Remove-Item -Recurse -Force $modelDstDist -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $modelDstDist -Force | Out-Null
+        Copy-Item -Recurse -Force "$modelSrc\*" $modelDstDist
+    } else {
+        Write-Warning "Flavor 'full' selected but .models folder is missing. Offline NLLB translation will not be bundled."
+    }
+
+    $easyModelSrc = Join-Path $env:USERPROFILE ".EasyOCR\model"
+    $easyModelDstDist = Join-Path $repoRoot "dist\ScreenTranslator\.easyocr\model"
+    if (Test-Path $easyModelSrc) {
+        Write-Host "==> Copying EasyOCR models into dist bundle"
+        Remove-Item -Recurse -Force $easyModelDstDist -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $easyModelDstDist -Force | Out-Null
+        Copy-Item -Recurse -Force "$easyModelSrc\*" $easyModelDstDist
+    } else {
+        Write-Warning "EasyOCR model cache not found at $easyModelSrc. Packaged app may need internet on first OCR run."
+    }
+}
 
 $releaseRoot = Join-Path $repoRoot "release"
-$bundleDir = Join-Path $releaseRoot "ScreenTranslator-$Version"
+$flavorSuffix = if ($Flavor -eq "full") { "full" } else { "lite" }
+$bundleDir = Join-Path $releaseRoot "ScreenTranslator-$Version-$flavorSuffix"
 New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
 
 Write-Host "==> Copying dist bundle to $bundleDir"
@@ -58,7 +97,10 @@ if (-not $SkipInstaller) {
 
     if ($isccPath) {
         Write-Host "==> Building installer with Inno Setup"
-        & $isccPath "/DMyAppVersion=$Version" "$repoRoot\scripts\release\installer.iss"
+        & $isccPath "/DMyAppVersion=$Version" "/DMyAppFlavor=$flavorSuffix" "$repoRoot\scripts\release\installer.iss"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup build failed."
+        }
     }
     else {
         Write-Warning "Inno Setup compiler (iscc.exe) not found. Installer step skipped."

@@ -15,18 +15,26 @@ python -m pip install -r requirements.txt
 Run from repo root:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\release\build.ps1 -Version 0.1.0 -Clean
+powershell -ExecutionPolicy Bypass -File .\scripts\release\build.ps1 -Version 0.1.0 -Flavor full -Clean
 ```
 
 If build machine already has PyInstaller and network is restricted:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\release\build.ps1 -Version 0.1.0 -Clean -SkipToolInstall
+powershell -ExecutionPolicy Bypass -File .\scripts\release\build.ps1 -Version 0.1.0 -Flavor full -Clean -SkipToolInstall
+```
+
+For a smaller online-first build:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\release\build.ps1 -Version 0.1.0 -Flavor lite -Clean -SkipToolInstall
 ```
 
 Output:
-- App bundle: `release/ScreenTranslator-0.1.0/`
-- Installer (if `iscc.exe` is installed): `release/ScreenTranslator-setup-0.1.0.exe`
+- Full app bundle: `release/ScreenTranslator-0.1.0-full/`
+- Full installer: `release/ScreenTranslator-setup-0.1.0-full.exe`
+- Lite app bundle: `release/ScreenTranslator-0.1.0-lite/`
+- Lite installer: `release/ScreenTranslator-setup-0.1.0-lite.exe`
 
 ## 3) Smoke test checklist
 
@@ -37,6 +45,7 @@ Output:
 - Verify primary OCR (rapidocr) works
 - Verify fallback OCR behavior when primary fails
 - Verify translation output appears in overlay
+- For full flavor, disable internet and verify offline NLLB translation still works
 
 ## 4) Release notes template
 
@@ -46,11 +55,4 @@ Output:
   - Windows app bundle build via PyInstaller
   - Windows installer via Inno Setup
   - AppData-based config path in packaged builds
-- Known limitations:
-  - Optional heavy backends (EasyOCR/NLLB/Argos) are excluded from default installer
-
-## 5) Optional heavy backend strategy
-
-Keep default installer light. Offer separate scripts/docs for users who need offline/large models:
-- `install_argos_model.py`
-- `install_nllb_ct2.py`
+  - Two packaging flavors (`full` with offline NLLB + `lite` online-first)

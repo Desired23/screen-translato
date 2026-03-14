@@ -100,6 +100,8 @@ DEFAULT_CONFIG = {
     "nllb_compute_type": "int8",
     "nllb_beam_size": 2,
     "nllb_max_decoding_length": 192,
+    # clip excessively long OCR paragraphs to keep local NLLB responsive
+    "nllb_max_source_tokens": 384,
     # refine short dialogue blocks using left/right neighbors without merging blocks
     "translation_context_refine_enabled": True,
     "translation_context_refine_max_chars": 48,
@@ -119,6 +121,8 @@ DEFAULT_CONFIG = {
     # reuse translations for near-identical OCR lines to reduce jitter cost
     "translation_semantic_cache_enabled": True,
     "custom_glossary_enabled": True,
+    # packaged safety mode: avoid native DLL crashes during first overlay boot
+    "safe_boot_native": True,
     # key: source phrase (EN), value: preferred translation (VI)
     "custom_glossary": {},
 }
@@ -129,7 +133,8 @@ def load_config() -> dict:
     config = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
         try:
-            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+            # utf-8-sig also accepts plain utf-8 and tolerates BOM-written files.
+            with CONFIG_FILE.open("r", encoding="utf-8-sig") as f:
                 saved = json.load(f)
                 config.update(saved)
         except (json.JSONDecodeError, IOError):

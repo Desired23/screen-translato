@@ -2,6 +2,8 @@
 import ctypes
 import ctypes.wintypes
 import traceback
+import sys
+import os
 import numpy as np
 from PyQt6.sip import voidptr
 from PyQt6.QtCore import Qt, QTimer, QPoint, QRect
@@ -14,6 +16,23 @@ from translator import TranslationEngine
 from renderer import TextRenderer
 from async_pipeline import AsyncTranslationPipeline, PipelineResult
 from config import load_config
+
+
+class _PassthroughTranslator:
+    """Safety translator: keep app alive when all translation backends fail to initialize."""
+
+    @property
+    def backend_name(self) -> str:
+        return "none"
+
+    @property
+    def backend_display_name(self) -> str:
+        return "none"
+
+    def translate_batch(self, texts: list[str], cancel_check=None) -> list[str]:
+        if cancel_check and cancel_check():
+            return []
+        return list(texts or [])
 
 
 
@@ -67,44 +86,35 @@ class OverlayWindow(QWidget):
     BORDER_WIDTH = 4
     MIN_SIZE = 150
 
+    @staticmethod
+    def _cfg_int(config: dict, key: str, default: int) -> int:
+        try:
+            return int(config.get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
     def __init__(self, config: dict | None = None):
         super().__init__()
 
-        self._config = config or load_config()
+        self._config = (config or load_config()).copy()
+        frozen = getattr(sys, "frozen", False)
+        safe_boot_env = str(os.getenv("ST_SAFE_BOOT_NATIVE", "1")).strip().lower()
+        self._safe_boot_native = frozen and safe_boot_env not in {"0", "false", "off", "no"}
+        if self._safe_boot_native:
+            # Safe boot for packaged builds: stick to the most stable OCR path.
+            self._config["safe_boot_native"] = True
+            self._config["winrt_enabled"] = True
+            self._config["easyocr_enabled"] = False
+            self._config["primary_backend"] = "winrt"
+            self._config["fallback_backend"] = "none"
+            print(
+                "[SafeBoot] Enabled (WinRT OCR primary, translation config preserved)",
+                flush=True,
+            )
         self._capture = ScreenCapture()
         source_lang = self._config.get("source_language", "en")
         self._ocr = OCREngine(source_language=source_lang, config=self._config)
-        self._translator = TranslationEngine(
-            target_language=self._config.get("target_language", "vi"),
-            source_language=source_lang,
-            translation_backend=self._config.get("translation_backend", "auto"),
-            fallback_to_google=bool(self._config.get("translation_fallback_to_google", True)),
-            argos_pivot_language=self._config.get("argos_pivot_language", "en"),
-            nllb_model_dir=self._config.get("nllb_model_dir", ".models/nllb-ct2-int8"),
-            nllb_tokenizer_path=self._config.get("nllb_tokenizer_path", ".models/nllb-ct2-int8"),
-            nllb_device=self._config.get("nllb_device", "cpu"),
-            nllb_compute_type=self._config.get("nllb_compute_type", "int8"),
-            nllb_beam_size=int(self._config.get("nllb_beam_size", 2)),
-            nllb_max_decoding_length=int(self._config.get("nllb_max_decoding_length", 192)),
-            context_refine_enabled=bool(self._config.get("translation_context_refine_enabled", True)),
-            context_refine_max_chars=int(self._config.get("translation_context_refine_max_chars", 48)),
-            context_refine_max_words=int(self._config.get("translation_context_refine_max_words", 10)),
-            context_refine_max_per_batch=int(self._config.get("translation_context_refine_max_per_batch", 1)),
-            manga_mode=bool(self._config.get("manga_translation_mode", True)),
-            manga_source_fixes_enabled=bool(self._config.get("manga_source_fixes_enabled", True)),
-            manga_target_post_edit_enabled=bool(self._config.get("manga_target_post_edit_enabled", True)),
-            auto_document_guard=bool(self._config.get("translation_auto_document_guard", True)),
-            game_term_guard_enabled=bool(self._config.get("translation_game_term_guard_enabled", True)),
-            game_post_edit_enabled=bool(self._config.get("translation_game_post_edit_enabled", True)),
-            auto_source_routing_enabled=bool(
-                self._config.get("translation_auto_source_routing_enabled", True)
-            ),
-            semantic_cache_enabled=bool(
-                self._config.get("translation_semantic_cache_enabled", True)
-            ),
-            custom_glossary_enabled=bool(self._config.get("custom_glossary_enabled", True)),
-            custom_glossary=self._config.get("custom_glossary", {}),
-        )
+        self._translator = self._create_translator(source_lang)
         self._renderer = TextRenderer(
             font_family=self._config.get("font_family", "Segoe UI"),
             text_color=self._config.get("text_color", "#000000"),
@@ -112,6 +122,12 @@ class OverlayWindow(QWidget):
             font_size_min=self._config.get("font_size_min", 10),
             font_size_max=self._config.get("font_size_max", 36),
         )
+        self._title_bar_color = QColor(self._config.get("title_bar_color", "#1a1a2e"))
+        if not self._title_bar_color.isValid():
+            self._title_bar_color = QColor("#1a1a2e")
+        self._border_color = QColor(self._config.get("border_color", "#ffffff"))
+        if not self._border_color.isValid():
+            self._border_color = QColor("#ffffff")
 
         # Translation results
         self._text_blocks: list[TextBlock] = []
@@ -153,6 +169,68 @@ class OverlayWindow(QWidget):
         # Pre-warm OCR backends in a background thread so app starts quickly
         import threading
         threading.Thread(target=self._ocr.warm_up, daemon=True, name="ocr-warmup").start()
+
+    def _create_translator(self, source_lang: str):
+        common_kwargs = dict(
+            target_language=self._config.get("target_language", "vi"),
+            source_language=source_lang,
+            fallback_to_google=bool(self._config.get("translation_fallback_to_google", True)),
+            argos_pivot_language=self._config.get("argos_pivot_language", "en"),
+            nllb_model_dir=self._config.get("nllb_model_dir", ".models/nllb-ct2-int8"),
+            nllb_tokenizer_path=self._config.get("nllb_tokenizer_path", ".models/nllb-ct2-int8"),
+            nllb_device=self._config.get("nllb_device", "cpu"),
+            nllb_compute_type=self._config.get("nllb_compute_type", "int8"),
+            nllb_beam_size=self._cfg_int(self._config, "nllb_beam_size", 2),
+            nllb_max_decoding_length=self._cfg_int(self._config, "nllb_max_decoding_length", 192),
+            nllb_max_source_tokens=self._cfg_int(self._config, "nllb_max_source_tokens", 384),
+            context_refine_enabled=bool(self._config.get("translation_context_refine_enabled", True)),
+            context_refine_max_chars=self._cfg_int(self._config, "translation_context_refine_max_chars", 48),
+            context_refine_max_words=self._cfg_int(self._config, "translation_context_refine_max_words", 10),
+            context_refine_max_per_batch=self._cfg_int(
+                self._config, "translation_context_refine_max_per_batch", 1
+            ),
+            manga_mode=bool(self._config.get("manga_translation_mode", True)),
+            manga_source_fixes_enabled=bool(self._config.get("manga_source_fixes_enabled", True)),
+            manga_target_post_edit_enabled=bool(self._config.get("manga_target_post_edit_enabled", True)),
+            auto_document_guard=bool(self._config.get("translation_auto_document_guard", True)),
+            game_term_guard_enabled=bool(self._config.get("translation_game_term_guard_enabled", True)),
+            game_post_edit_enabled=bool(self._config.get("translation_game_post_edit_enabled", True)),
+            auto_source_routing_enabled=bool(
+                self._config.get("translation_auto_source_routing_enabled", True)
+            ),
+            semantic_cache_enabled=bool(
+                self._config.get("translation_semantic_cache_enabled", True)
+            ),
+            custom_glossary_enabled=bool(self._config.get("custom_glossary_enabled", True)),
+            custom_glossary=self._config.get("custom_glossary", {}),
+        )
+
+        preferred = self._config.get("translation_backend", "auto")
+        attempts = [preferred, "auto", "google"]
+        seen = set()
+        errors: list[str] = []
+
+        for backend in attempts:
+            if backend in seen:
+                continue
+            seen.add(backend)
+            try:
+                tr = TranslationEngine(translation_backend=backend, **common_kwargs)
+                if backend != preferred:
+                    print(
+                        f"[Translator] startup fallback backend='{backend}' (from '{preferred}'), config preserved",
+                        flush=True,
+                    )
+                return tr
+            except Exception as exc:
+                errors.append(f"{backend}: {exc}")
+
+        print(
+            f"[Translator] Failed to initialize any backend at startup. "
+            f"Using passthrough mode. Errors: {' | '.join(errors)}",
+            flush=True,
+        )
+        return _PassthroughTranslator()
 
     def _setup_ui(self):
         """Configure the overlay window."""
@@ -346,7 +424,7 @@ class OverlayWindow(QWidget):
 
         # â”€â”€ Title bar (compact, subtle) â”€â”€
         title_rect = QRect(0, 0, w, self.TITLE_BAR_HEIGHT)
-        title_bg = QColor("#1a1a2e")
+        title_bg = QColor(self._title_bar_color)
         title_bg.setAlpha(200)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(title_bg))
@@ -379,7 +457,7 @@ class OverlayWindow(QWidget):
         freeze_rect = QRect(w - 56, 3, 22, 18)
         painter.setBrush(QBrush(QColor(100, 150, 255, 150) if self._is_frozen else QColor(100, 100, 100, 100)))
         painter.drawRoundedRect(freeze_rect, 3, 3)
-        painter.setPen(QPen(QColor("#ffffff")))
+        painter.setPen(QPen(QColor(self._border_color)))
         freeze_icon = "F" if self._is_frozen else "P"
         painter.drawText(freeze_rect, Qt.AlignmentFlag.AlignCenter, freeze_icon)
         
@@ -388,7 +466,7 @@ class OverlayWindow(QWidget):
         refresh_rect = QRect(w - 84, 3, 22, 18)
         painter.setBrush(QBrush(QColor(100, 100, 100, 100)))
         painter.drawRoundedRect(refresh_rect, 3, 3)
-        painter.setPen(QPen(QColor("#ffffff")))
+        painter.setPen(QPen(QColor(self._border_color)))
         painter.drawText(refresh_rect, Qt.AlignmentFlag.AlignCenter, "R")
 
         # â”€â”€ Close button (small) â”€â”€
@@ -402,12 +480,13 @@ class OverlayWindow(QWidget):
         painter.drawText(close_rect, Qt.AlignmentFlag.AlignCenter, "X")
 
         # â”€â”€ Border â€” white, thin â”€â”€
-        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.setPen(QPen(QColor(self._border_color), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(QRect(0, 0, w - 1, h - 1), 4, 4)
 
         # â”€â”€ Resize handle (subtle) â”€â”€
-        handle_color = QColor(255, 255, 255, 80)
+        handle_color = QColor(self._border_color)
+        handle_color.setAlpha(80)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(handle_color))
         painter.drawRect(QRect(w - 10, h - 10, 8, 2))

@@ -3,27 +3,19 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
+import sys
 import threading
+from pathlib import Path
+from native_probe import probe_argos, probe_nllb
 
 try:
     from deep_translator import GoogleTranslator
 except Exception:
     GoogleTranslator = None
 
-try:
-    import argostranslate.translate as argos_translate
-except Exception:
-    argos_translate = None
-
-try:
-    import ctranslate2
-except Exception:
-    ctranslate2 = None
-
-try:
-    from transformers import AutoTokenizer
-except Exception:
-    AutoTokenizer = None
+argos_translate = None
+ctranslate2 = None
+AutoTokenizer = None
 
 
 class _GoogleBackend:
@@ -46,6 +38,7 @@ class _ArgosBackend:
         "zh-hans": "zh",
         "zh-hant": "zh",
         "pt-br": "pt",
+        "ja-jp": "ja",
     }
 
     @classmethod
@@ -61,6 +54,18 @@ class _ArgosBackend:
         target_language: str,
         pivot_language: str = "en",
     ):
+        global argos_translate
+        if argos_translate is None:
+            ok, reason = probe_argos(timeout_sec=8.0)
+            # Argos may throw a benign WinError 183 on first-run folder init in probe.
+            if (not ok) and ("WinError 183" not in str(reason)):
+                raise RuntimeError(f"argostranslate probe failed: {reason}")
+            try:
+                import argostranslate.translate as _argos_translate
+
+                argos_translate = _argos_translate
+            except Exception as exc:
+                raise RuntimeError(f"argostranslate import failed: {exc}") from exc
         if argos_translate is None:
             raise RuntimeError("argostranslate is not installed")
 
@@ -192,6 +197,7 @@ class _NllbBackend:
         "zh-hans": "zh",
         "zh-hant": "zh-tw",
         "pt-br": "pt",
+        "ja-jp": "ja",
     }
 
     _NLLB_LANG = {
@@ -216,6 +222,28 @@ class _NllbBackend:
         code = (code or "").strip().lower()
         return cls._LANG_ALIASES.get(code, code)
 
+    @staticmethod
+    def _resolve_local_dir(path_value: str) -> str:
+        """Resolve model/tokenizer paths robustly for both dev and packaged builds."""
+        raw = Path(str(path_value or "").strip()).expanduser()
+        if raw.is_absolute():
+            return str(raw.resolve())
+
+        base_candidates: list[Path] = []
+        if getattr(sys, "frozen", False):
+            base_candidates.append(Path(sys.executable).resolve().parent)
+        base_candidates.append(Path(__file__).resolve().parent)
+        base_candidates.append(Path.cwd())
+
+        for base in base_candidates:
+            candidate = (base / raw).resolve()
+            if candidate.exists():
+                return str(candidate)
+
+        # Prefer executable-relative path when frozen, source-relative otherwise.
+        preferred_base = base_candidates[0]
+        return str((preferred_base / raw).resolve())
+
     def __init__(
         self,
         source_language: str,
@@ -226,7 +254,27 @@ class _NllbBackend:
         compute_type: str = "int8",
         beam_size: int = 2,
         max_decoding_length: int = 192,
+        max_source_tokens: int = 384,
     ):
+        global ctranslate2, AutoTokenizer
+        ok, reason = probe_nllb(
+            model_dir=model_dir,
+            tokenizer_path=tokenizer_path,
+            device=device,
+            compute_type=compute_type,
+            timeout_sec=20.0,
+        )
+        if not ok:
+            raise RuntimeError(f"NLLB probe failed: {reason}")
+
+        if ctranslate2 is None:
+            import ctranslate2 as _ctranslate2
+
+            ctranslate2 = _ctranslate2
+        if AutoTokenizer is None:
+            from transformers import AutoTokenizer as _AutoTokenizer
+
+            AutoTokenizer = _AutoTokenizer
         if ctranslate2 is None:
             raise RuntimeError("ctranslate2 is not installed")
         if AutoTokenizer is None:
@@ -242,11 +290,13 @@ class _NllbBackend:
         if not src_tag or not tgt_tag:
             raise RuntimeError(f"NLLB language mapping missing for {src_code}->{tgt_code}")
 
-        resolved_model_dir = os.path.abspath(model_dir)
+        resolved_model_dir = self._resolve_local_dir(model_dir)
         if not os.path.isdir(resolved_model_dir):
             raise RuntimeError(f"NLLB model directory not found: {resolved_model_dir}")
 
-        resolved_tokenizer = os.path.abspath(tokenizer_path) if tokenizer_path else resolved_model_dir
+        resolved_tokenizer = (
+            self._resolve_local_dir(tokenizer_path) if tokenizer_path else resolved_model_dir
+        )
         if not os.path.isdir(resolved_tokenizer):
             # Allow loading from HF cache key if caller passes repo id string.
             resolved_tokenizer = tokenizer_path or resolved_model_dir
@@ -266,6 +316,8 @@ class _NllbBackend:
         self._tgt_tag = tgt_tag
         self._beam_size = max(1, int(beam_size))
         self._max_decoding_length = max(32, int(max_decoding_length))
+        # Guard against pathological OCR paragraphs causing very slow local inference.
+        self._max_source_tokens = max(64, int(max_source_tokens))
         self.route_name = f"{src_code}->{tgt_code}"
 
     def _resolve_src_tag(self, source_language: str | None) -> str:
@@ -275,7 +327,13 @@ class _NllbBackend:
 
     def _encode_source_tokens(self, text: str, source_language: str | None = None) -> list[str]:
         self._tokenizer.src_lang = self._resolve_src_tag(source_language)
-        encoded = self._tokenizer(text, return_attention_mask=False, return_tensors=None)
+        encoded = self._tokenizer(
+            text,
+            return_attention_mask=False,
+            return_tensors=None,
+            truncation=True,
+            max_length=self._max_source_tokens,
+        )
         input_ids = encoded.get("input_ids", [])
         if input_ids and isinstance(input_ids[0], list):
             input_ids = input_ids[0]
@@ -380,6 +438,7 @@ class TranslationEngine:
         nllb_compute_type: str = "int8",
         nllb_beam_size: int = 2,
         nllb_max_decoding_length: int = 192,
+        nllb_max_source_tokens: int = 384,
         context_refine_enabled: bool = True,
         context_refine_max_chars: int = 48,
         context_refine_max_words: int = 10,
@@ -408,6 +467,7 @@ class TranslationEngine:
         self._nllb_compute_type = str(nllb_compute_type or "int8")
         self._nllb_beam_size = max(1, int(nllb_beam_size))
         self._nllb_max_decoding_length = max(32, int(nllb_max_decoding_length))
+        self._nllb_max_source_tokens = max(64, int(nllb_max_source_tokens))
         self._context_refine_enabled = bool(context_refine_enabled)
         self._context_refine_max_chars = max(10, int(context_refine_max_chars))
         self._context_refine_max_words = max(2, int(context_refine_max_words))
@@ -716,6 +776,7 @@ class TranslationEngine:
                         compute_type=self._nllb_compute_type,
                         beam_size=self._nllb_beam_size,
                         max_decoding_length=self._nllb_max_decoding_length,
+                        max_source_tokens=self._nllb_max_source_tokens,
                     )
                     route = getattr(self._translator, "route_name", "")
                 elif name == "argos":

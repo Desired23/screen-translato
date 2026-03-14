@@ -6,7 +6,9 @@ warnings.filterwarnings("ignore", message=".*pin_memory.*", category=UserWarning
 from dataclasses import dataclass
 import sys
 import asyncio
+from pathlib import Path
 import numpy as np
+from native_probe import probe_rapidocr
 
 
 # mapping from language code to EasyOCR language code(s)
@@ -15,6 +17,7 @@ EASYOCR_LANG_MAP = {
     "en": ["en"],
     "ko": ["ko"],      # ko-only: ~839ms vs ko+en: ~1822ms
     "ja": ["ja"],
+    "ja-jp": ["ja"],
     "zh-CN": ["ch_sim"],
     "zh-TW": ["ch_tra"],
     "vi": ["en"],
@@ -34,6 +37,18 @@ BACKEND_PADDLEOCR = "paddleocr"
 BACKEND_WINRT = "winrt"
 BACKEND_EASYOCR = "easyocr"
 BACKEND_NONE = "none"
+
+
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        key = str(raw or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(str(raw).strip())
+    return out
 
 
 @dataclass
@@ -341,7 +356,17 @@ class _EasyOCREngine(_BaseEngine):
         codes = EASYOCR_LANG_MAP.get(self._lang, ["en"])
         try:
             import easyocr
-            self._reader = easyocr.Reader(codes, gpu=False, verbose=False)
+            reader_kwargs = dict(gpu=False, verbose=False)
+            if getattr(sys, "frozen", False):
+                bundled_model_dir = Path(sys.executable).resolve().parent / ".easyocr" / "model"
+                if bundled_model_dir.is_dir():
+                    reader_kwargs["model_storage_directory"] = str(bundled_model_dir)
+                    reader_kwargs["download_enabled"] = False
+                    print(
+                        f"[OCR] EasyOCR using bundled models: {bundled_model_dir}",
+                        flush=True,
+                    )
+            self._reader = easyocr.Reader(codes, **reader_kwargs)
             self._loaded_lang = self._lang
             print(f"[OCR] Loaded EasyOCR ({codes})", flush=True)
         except Exception as e:
@@ -380,7 +405,8 @@ class _WinRTEngine(_BaseEngine):
     """OCR using Windows Runtime (WinRT) API. Very fast when language pack exists."""
 
     def __init__(self, lang: str):
-        self._lang_tag = lang
+        self._requested_lang_tag = str(lang or "en").strip()
+        self._lang_tag = self._requested_lang_tag
         self._engine = None
         self._imaging = None
         self._streams = None
@@ -404,32 +430,79 @@ class _WinRTEngine(_BaseEngine):
         self._imaging = imaging
         self._streams = streams
 
-        # try to create engine for the desired language; the call may
-        # hang indefinitely if the language pack isn't present, so run it
-        # in a separate thread with a short timeout.
-        def make_engine(q):
+        # try to create engine for candidate language tags; call may hang
+        # if language pack is missing, so run each attempt in a short timeout thread.
+        def _try_create_engine(lang_tag: str):
             try:
-                q.put(winrt_ocr.OcrEngine.try_create_from_language(Language(self._lang_tag)))
-            except Exception as e:
-                q.put(e)
+                import threading
+                import queue
 
-        import threading, queue
-        q: "queue.Queue[object]" = queue.Queue()
-        th = threading.Thread(target=make_engine, args=(q,))
-        th.daemon = True
-        th.start()
-        th.join(2.0)  # wait up to 2 seconds
-        if q.empty():
-            print(f"[OCR] WinRT try_create_from_language({self._lang_tag}) timed out (pack missing?)", flush=True)
+                q: "queue.Queue[object]" = queue.Queue()
+
+                def _worker():
+                    try:
+                        q.put(winrt_ocr.OcrEngine.try_create_from_language(Language(lang_tag)))
+                    except Exception as exc:
+                        q.put(exc)
+
+                th = threading.Thread(target=_worker, daemon=True)
+                th.start()
+                th.join(2.0)
+                if q.empty():
+                    print(
+                        f"[OCR] WinRT try_create_from_language({lang_tag}) timed out",
+                        flush=True,
+                    )
+                    return None
+                res = q.get()
+                if isinstance(res, Exception):
+                    print(f"[OCR] WinRT init raised for '{lang_tag}': {res}", flush=True)
+                    return None
+                return res
+            except Exception as exc:
+                print(f"[OCR] WinRT init failed for '{lang_tag}': {exc}", flush=True)
+                return None
+
+        available_tags: list[str] = []
+        try:
+            recognizers = list(winrt_ocr.OcrEngine.available_recognizer_languages or [])
+            for lang_obj in recognizers:
+                tag = getattr(lang_obj, "language_tag", None)
+                if tag:
+                    available_tags.append(str(tag))
+        except Exception:
+            pass
+
+        requested = self._requested_lang_tag
+        requested_base = requested.split("-")[0].lower()
+        candidates = [requested]
+        if "-" in requested:
+            candidates.append(requested_base)
+        if available_tags:
+            for tag in available_tags:
+                tag_base = tag.split("-")[0].lower()
+                if tag_base == requested_base:
+                    candidates.append(tag)
+            candidates.extend(["en", "en-us", "en-US"])
+            candidates.append(available_tags[0])
+        candidates = _dedupe_keep_order(candidates)
+
+        for candidate in candidates:
+            engine = _try_create_engine(candidate)
+            if engine is None:
+                continue
+            self._engine = engine
+            self._lang_tag = candidate
+            if candidate.lower() != requested.lower():
+                print(
+                    f"[OCR] WinRT language fallback: requested='{requested}' using='{candidate}'",
+                    flush=True,
+                )
+            else:
+                print(f"[OCR] WinRT language ready: '{candidate}'", flush=True)
             return
-        result = q.get()
-        if isinstance(result, Exception):
-            print(f"[OCR] WinRT init raised", result, flush=True)
-            return
-        self._engine = result
-        if self._engine is None:
-            # most likely the language pack wasn't installed
-            print(f"[OCR] WinRT engine unavailable for '{self._lang_tag}'", flush=True)
+
+        print(f"[OCR] WinRT engine unavailable for '{requested}'", flush=True)
 
     def detect(self, image: np.ndarray, min_confidence: float = 0.3) -> list[TextBlock]:
         if self._engine is None:
@@ -470,9 +543,46 @@ class _WinRTEngine(_BaseEngine):
             print(f"[OCR] WinRT recognition failed: {e}", flush=True)
             return []
         blocks: list[TextBlock] = []
+
+        def _rect_tuple(rect_obj):
+            if rect_obj is None:
+                return None
+            x = getattr(rect_obj, "x", None)
+            y = getattr(rect_obj, "y", None)
+            w0 = getattr(rect_obj, "width", None)
+            h0 = getattr(rect_obj, "height", None)
+            if None in (x, y, w0, h0):
+                return None
+            return float(x), float(y), float(w0), float(h0)
+
         for line in result.lines:
-            rect = line.bounding_rect
-            x, y, w0, h0 = rect.x, rect.y, rect.width, rect.height
+            rect = getattr(line, "bounding_rect", None)
+            rect_t = _rect_tuple(rect)
+
+            # Some winrt-python versions expose bounds only on words.
+            if rect_t is None:
+                words = list(getattr(line, "words", []) or [])
+                if words:
+                    xs: list[float] = []
+                    ys: list[float] = []
+                    x2s: list[float] = []
+                    y2s: list[float] = []
+                    for wobj in words:
+                        w_rect = _rect_tuple(getattr(wobj, "bounding_rect", None))
+                        if w_rect is None:
+                            continue
+                        wx, wy, ww, wh = w_rect
+                        xs.append(wx)
+                        ys.append(wy)
+                        x2s.append(wx + ww)
+                        y2s.append(wy + wh)
+                    if xs:
+                        rect_t = (min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys))
+
+            if rect_t is None:
+                continue
+
+            x, y, w0, h0 = rect_t
             bbox = [[x, y], [x + w0, y], [x + w0, y + h0], [x, y + h0]]
             text = line.text or ""
             blocks.append(TextBlock(text=text, bbox=bbox, confidence=1.0))
@@ -489,6 +599,11 @@ class _RapidEngine(_BaseEngine):
         self._quality_retry_enabled = bool(self._config.get("rapid_quality_retry", False))
         self._joined_ratio_threshold = float(self._config.get("rapid_joined_ratio_threshold", 0.35))
         self._quality_score_margin = float(self._config.get("rapid_quality_margin", 0.03))
+        ok, reason = probe_rapidocr(timeout_sec=8.0)
+        if not ok:
+            print(f"[OCR] RapidOCR probe failed: {reason}", flush=True)
+            print("[OCR] RapidOCR disabled to prevent native crash; using fallback backends.", flush=True)
+            return
         try:
             from rapidocr_onnxruntime import RapidOCR
             self._rapid = RapidOCR()
@@ -793,6 +908,26 @@ class OCREngine:
         wanted_fallback = self._config.get("fallback_backend", BACKEND_NONE)
         winrt_ok   = self._config.get("winrt_enabled",   False)
         easyocr_ok = self._config.get("easyocr_enabled", False)
+        frozen_safe_boot = getattr(sys, "frozen", False) and bool(
+            self._config.get("safe_boot_native", True)
+        )
+
+        if frozen_safe_boot:
+            # Packaged safe mode: force WinRT-only OCR path to avoid native DLL crashes.
+            winrt_ok = True
+            easyocr_ok = False
+            if wanted_primary != BACKEND_WINRT:
+                print(
+                    f"[SafeBoot] OCR primary '{wanted_primary}' -> '{BACKEND_WINRT}'",
+                    flush=True,
+                )
+            wanted_primary = BACKEND_WINRT
+            if wanted_fallback != BACKEND_NONE:
+                print(
+                    f"[SafeBoot] OCR fallback '{wanted_fallback}' disabled in packaged mode",
+                    flush=True,
+                )
+            wanted_fallback = BACKEND_NONE
 
         # Respect opt-in guards
         if wanted_primary == BACKEND_WINRT and not winrt_ok:
@@ -818,7 +953,8 @@ class OCREngine:
             cascade = []
             if winrt_ok:
                 cascade.append(BACKEND_WINRT)
-            cascade.append(BACKEND_RAPIDOCR)
+            if not frozen_safe_boot:
+                cascade.append(BACKEND_RAPIDOCR)
             if easyocr_ok:
                 cascade.append(BACKEND_EASYOCR)
             for name in cascade:
@@ -845,6 +981,25 @@ class OCREngine:
                 print(f"[OCR] Fallback '{wanted_fallback}' unavailable", flush=True)
         elif wanted_fallback == BACKEND_PADDLEOCR:
             print("[OCR] PaddleOCR skipped (broken oneDNN)", flush=True)
+
+        # Emergency fallback for packaged/runtime DLL mismatch cases.
+        if self._primary is None:
+            emergency_order = (
+                [BACKEND_WINRT]
+                if frozen_safe_boot
+                else [BACKEND_WINRT, BACKEND_EASYOCR]
+            )
+            for name in emergency_order:
+                if name == self._primary_name:
+                    continue
+                emergency = _make_engine(name, self._source_language, self._config)
+                if emergency is not None:
+                    self._primary = emergency
+                    self._primary_name = name
+                    print(f"[OCR] Emergency fallback activated: {name}", flush=True)
+                    break
+            if self._primary is None:
+                print("[OCR] No OCR backend available", flush=True)
 
 
     # ── Public API ──────────────────────────────────────────────────────
@@ -919,4 +1074,4 @@ class OCREngine:
                 self._fallback.detect(dummy)
             except Exception:
                 pass
-        print("[OCR] Warm-up done ✅", flush=True)
+        print("[OCR] Warm-up done", flush=True)

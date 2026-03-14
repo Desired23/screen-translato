@@ -1,15 +1,79 @@
 ﻿# main.py - Entry point with system tray and global hotkey
+import os
 import sys
+import ctypes
+import ctypes.wintypes
+import traceback
+import threading
+import faulthandler
+import multiprocessing as mp
+from datetime import datetime
+from pathlib import Path
 
-# IMPORTANT: Import torch BEFORE PyQt6 to avoid DLL conflict on Windows
-# PyQt6 modifies DLL search paths which prevents torch's c10.dll from loading
-try:
-    import torch  # noqa: F401 - pre-load torch DLLs
-except (ImportError, OSError):
-    pass
+
+def _setup_frozen_logging():
+    """Redirect stdout/stderr to AppData log file in packaged builds."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+        log_dir = os.path.join(appdata, "ScreenTranslator", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_path = os.path.join(log_dir, f"app-{timestamp}-p{os.getpid()}.log")
+        log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+        sys.stdout = log_file
+        sys.stderr = log_file
+        print(f"[Startup] Logging to {log_path}", flush=True)
+    except Exception:
+        pass
+
+
+_setup_frozen_logging()
+
+
+def _install_global_exception_hooks():
+    """Keep crashes visible in frozen builds by forcing stack traces to log."""
+
+    def _sys_hook(exc_type, exc_value, exc_tb):
+        try:
+            print("[Fatal] Unhandled exception in main thread", flush=True)
+            traceback.print_exception(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    def _thread_hook(args):
+        try:
+            print(
+                f"[Fatal] Unhandled exception in thread {getattr(args, 'thread', None)}",
+                flush=True,
+            )
+            traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        except Exception:
+            pass
+
+    sys.excepthook = _sys_hook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_hook
+
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+
+
+_install_global_exception_hooks()
+
+# Avoid eager torch import in packaged builds.
+# It can trigger native access violations on some machines before UI startup.
+if not getattr(sys, "frozen", False):
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        pass
 
 from pynput import keyboard as pynput_keyboard
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, qInstallMessageHandler
 from PyQt6.QtGui import QIcon, QAction, QFont, QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -27,12 +91,51 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QGroupBox,
     QMessageBox,
+    QColorDialog,
     QScrollArea,
     QWidget,
 )
 
 from config import load_config, save_config
 from overlay import OverlayWindow
+
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Prevent multiple running instances that duplicate tray icons."""
+    global _SINGLE_INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    error_already_exists = 183
+    mutex_names = [
+        "Local\\ScreenTranslatorSingletonMutex",
+        "Global\\ScreenTranslatorSingletonMutex",
+    ]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        ctypes.wintypes.LPVOID,
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.LPCWSTR,
+    )
+    kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+
+    for mutex_name in mutex_names:
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        last_error = ctypes.get_last_error()
+        if not handle:
+            continue
+        if last_error == error_already_exists:
+            kernel32.CloseHandle(handle)
+            return False
+        _SINGLE_INSTANCE_MUTEX = handle
+        return True
+
+    print("[Startup] Failed to create single-instance mutex.", flush=True)
+    return True
 
 
 # Source languages (for OCR - what's on screen)
@@ -134,7 +237,97 @@ class SettingsDialog(QDialog):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self._config = config.copy()
+        self._color_values: dict[str, str] = {}
+        self._color_buttons: dict[str, QPushButton] = {}
         self._setup_ui()
+
+    @staticmethod
+    def _normalize_hex_color(value: str, default: str) -> str:
+        color = QColor(str(value or ""))
+        if not color.isValid():
+            color = QColor(default)
+        return color.name(QColor.NameFormat.HexRgb)
+
+    def _runtime_path(self, raw_path: str) -> Path:
+        path = Path(str(raw_path or "").strip()).expanduser()
+        if path.is_absolute():
+            return path
+        bases: list[Path] = []
+        if getattr(sys, "frozen", False):
+            bases.append(Path(sys.executable).resolve().parent)
+        bases.append(Path(__file__).resolve().parent)
+        bases.append(Path.cwd())
+        for base in bases:
+            candidate = (base / path).resolve()
+            if candidate.exists():
+                return candidate
+        return (bases[0] / path).resolve() if bases else path.resolve()
+
+    def _refresh_color_button(self, key: str):
+        btn = self._color_buttons.get(key)
+        color = self._color_values.get(key, "#ffffff")
+        if btn is None:
+            return
+        btn.setText(color.upper())
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {color}; color: {'#000000' if QColor(color).lightness() > 150 else '#ffffff'}; "
+            "border: 1px solid #2a2a4a; border-radius: 6px; padding: 6px 10px; font-weight: bold; }"
+        )
+
+    def _pick_color(self, key: str):
+        initial = QColor(self._color_values.get(key, "#ffffff"))
+        color = QColorDialog.getColor(initial, self, "Pick Color")
+        if not color.isValid():
+            return
+        self._color_values[key] = color.name(QColor.NameFormat.HexRgb)
+        self._refresh_color_button(key)
+
+    def _validate_nllb_before_save(self) -> bool:
+        backend = self._translation_backend_combo.currentData()
+        if backend != "nllb":
+            return True
+
+        model_dir = self._runtime_path(self._config.get("nllb_model_dir", ".models/nllb-ct2-int8"))
+        tok_path = self._runtime_path(self._config.get("nllb_tokenizer_path", ".models/nllb-ct2-int8"))
+        errors: list[str] = []
+
+        if not model_dir.is_dir():
+            errors.append(f"- Model dir not found: {model_dir}")
+        elif not (model_dir / "model.bin").exists():
+            errors.append(f"- Missing file: {model_dir / 'model.bin'}")
+
+        tokenizer_ok = False
+        if tok_path.is_dir():
+            tokenizer_ok = any(
+                (tok_path / name).exists()
+                for name in ("tokenizer.json", "sentencepiece.bpe.model")
+            )
+        elif tok_path.is_file():
+            tokenizer_ok = tok_path.name in {"tokenizer.json", "sentencepiece.bpe.model"}
+        if not tokenizer_ok:
+            errors.append(
+                "- Tokenizer path must contain tokenizer.json or sentencepiece.bpe.model "
+                f"(current: {tok_path})"
+            )
+
+        if not errors:
+            return True
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("NLLB Validation Failed")
+        msg.setText("NLLB backend is not ready. Choose an action:")
+        msg.setInformativeText("\n".join(errors))
+        switch_btn = msg.addButton("Switch to AUTO and Save", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        if msg.clickedButton() == switch_btn:
+            idx = self._translation_backend_combo.findData("auto")
+            if idx >= 0:
+                self._translation_backend_combo.setCurrentIndex(idx)
+            self._config["translation_backend"] = "auto"
+            return True
+        return False
 
     def _setup_ui(self):
         self.setWindowTitle("Settings - Screen Translator")
@@ -404,6 +597,49 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(settings_group)
 
+        display_group = QGroupBox("Display")
+        dl = QVBoxLayout(display_group)
+        dl.addWidget(QLabel("Overlay title bar color:"))
+        self._color_values["title_bar_color"] = self._normalize_hex_color(
+            self._config.get("title_bar_color", "#1a1a2e"), "#1a1a2e"
+        )
+        self._title_bar_btn = QPushButton()
+        self._color_buttons["title_bar_color"] = self._title_bar_btn
+        self._title_bar_btn.clicked.connect(lambda: self._pick_color("title_bar_color"))
+        self._refresh_color_button("title_bar_color")
+        dl.addWidget(self._title_bar_btn)
+
+        dl.addWidget(QLabel("Overlay border color:"))
+        self._color_values["border_color"] = self._normalize_hex_color(
+            self._config.get("border_color", "#ffffff"), "#ffffff"
+        )
+        self._border_btn = QPushButton()
+        self._color_buttons["border_color"] = self._border_btn
+        self._border_btn.clicked.connect(lambda: self._pick_color("border_color"))
+        self._refresh_color_button("border_color")
+        dl.addWidget(self._border_btn)
+
+        dl.addWidget(QLabel("Translation text color:"))
+        self._color_values["text_color"] = self._normalize_hex_color(
+            self._config.get("text_color", "#000000"), "#000000"
+        )
+        self._text_btn = QPushButton()
+        self._color_buttons["text_color"] = self._text_btn
+        self._text_btn.clicked.connect(lambda: self._pick_color("text_color"))
+        self._refresh_color_button("text_color")
+        dl.addWidget(self._text_btn)
+
+        dl.addWidget(QLabel("Translation background color:"))
+        self._color_values["background_color"] = self._normalize_hex_color(
+            self._config.get("background_color", "#ffffff"), "#ffffff"
+        )
+        self._bg_btn = QPushButton()
+        self._color_buttons["background_color"] = self._bg_btn
+        self._bg_btn.clicked.connect(lambda: self._pick_color("background_color"))
+        self._refresh_color_button("background_color")
+        dl.addWidget(self._bg_btn)
+        layout.addWidget(display_group)
+
         ocr_group = QGroupBox("OCR")
         ocr_group.setStyleSheet("""
             QCheckBox {
@@ -519,6 +755,12 @@ class SettingsDialog(QDialog):
         self._config["confidence_thresh"] = self._conf_spin.value()
         self._config["winrt_enabled"] = self._winrt_cb.isChecked()
         self._config["easyocr_enabled"] = self._easyocr_cb.isChecked()
+        self._config["title_bar_color"] = self._color_values.get("title_bar_color", "#1a1a2e")
+        self._config["border_color"] = self._color_values.get("border_color", "#ffffff")
+        self._config["text_color"] = self._color_values.get("text_color", "#000000")
+        self._config["background_color"] = self._color_values.get("background_color", "#ffffff")
+        if not self._validate_nllb_before_save():
+            return
         save_config(self._config)
         self.accept()
 
@@ -557,17 +799,87 @@ class ScreenTranslatorApp:
     def __init__(self):
         self._app = QApplication(sys.argv)
         self._app.setQuitOnLastWindowClosed(False)
+        self._qt_message_handler = None
 
         self._config = load_config()
         self._overlay: OverlayWindow | None = None
+        self._tray: QSystemTrayIcon | None = None
         self._hotkey_listener = None
         self._pressed_keys = set()
 
+        self._setup_qt_logging()
         self._setup_tray()
         self._register_hotkey()
+        self._setup_autotest_hooks()
+
+    def _setup_autotest_hooks(self):
+        """Optional test hooks for packaged smoke tests."""
+        auto_toggle = str(os.getenv("ST_AUTOTEST_TOGGLE_ON_START", "")).strip() == "1"
+        if auto_toggle:
+            QTimer.singleShot(
+                1200,
+                lambda: self._safe_call(self._toggle_overlay, "autotest-toggle"),
+            )
+
+        quit_after_raw = str(os.getenv("ST_AUTOTEST_QUIT_MS", "")).strip()
+        if not quit_after_raw:
+            return
+        try:
+            quit_after_ms = int(quit_after_raw)
+        except ValueError:
+            quit_after_ms = 0
+        if quit_after_ms > 0:
+            QTimer.singleShot(
+                quit_after_ms,
+                lambda: self._safe_call(self._quit, "autotest-quit"),
+            )
+
+    def _setup_qt_logging(self):
+        """Route Qt warnings/errors into the same app log file."""
+
+        def _handler(mode, context, message):
+            level_map = {
+                0: "QtDebug",
+                1: "QtWarning",
+                2: "QtCritical",
+                3: "QtFatal",
+                4: "QtInfo",
+            }
+            try:
+                level = level_map.get(int(mode), "Qt")
+            except Exception:
+                level = "Qt"
+            print(f"[{level}] {message}", flush=True)
+
+        self._qt_message_handler = _handler
+        qInstallMessageHandler(self._qt_message_handler)
+
+    def _safe_call(self, fn, context: str):
+        """Protect tray/UI callbacks from killing the process."""
+        try:
+            fn()
+        except Exception:
+            print(f"[UI] Callback failure: {context}", flush=True)
+            traceback.print_exc()
+            if self._tray is not None:
+                self._tray.showMessage(
+                    "Screen Translator",
+                    f"Internal error in {context}. Check logs in %APPDATA%\\ScreenTranslator\\logs.",
+                    QSystemTrayIcon.MessageIcon.Critical,
+                    5000,
+                )
 
     def _setup_tray(self):
         """Set up system tray icon and menu."""
+        if self._tray is not None:
+            try:
+                self._tray.activated.disconnect()
+            except Exception:
+                pass
+            self._tray.hide()
+            self._tray.deleteLater()
+            self._tray = None
+
         icon = QIcon(create_tray_icon())
         self._tray = QSystemTrayIcon(icon, self._app)
 
@@ -590,13 +902,19 @@ class ScreenTranslatorApp:
         """)
 
         toggle_action = QAction(f"Toggle Overlay ({self._config['hotkey']})", self._app)
-        toggle_action.triggered.connect(self._toggle_overlay)
+        toggle_action.triggered.connect(
+            lambda _checked=False: self._safe_call(self._toggle_overlay, "tray-toggle")
+        )
 
         settings_action = QAction("Settings", self._app)
-        settings_action.triggered.connect(self._show_settings)
+        settings_action.triggered.connect(
+            lambda _checked=False: self._safe_call(self._show_settings, "tray-settings")
+        )
 
         quit_action = QAction("Quit", self._app)
-        quit_action.triggered.connect(self._quit)
+        quit_action.triggered.connect(
+            lambda _checked=False: self._safe_call(self._quit, "tray-quit")
+        )
 
         menu.addAction(toggle_action)
         menu.addSeparator()
@@ -606,8 +924,9 @@ class ScreenTranslatorApp:
 
         self._tray.setContextMenu(menu)
         self._tray.setToolTip("Screen Translator - Press " + self._config["hotkey"])
-        self._tray.activated.connect(lambda _reason: self._toggle_overlay())
+        self._tray.activated.connect(self._on_tray_activated)
         self._tray.show()
+        print("[Tray] Icon initialized", flush=True)
 
         # Show notification
         self._tray.showMessage(
@@ -704,14 +1023,46 @@ class ScreenTranslatorApp:
 
     def _toggle_overlay(self):
         """Toggle the overlay window visibility."""
-        if self._overlay is None:
-            self._overlay = OverlayWindow(self._config)
+        try:
+            if self._overlay is None:
+                try:
+                    self._overlay = OverlayWindow(self._config)
+                except Exception as e:
+                    print(f"[Overlay] Failed to create overlay: {e}", flush=True)
+                    self._tray.showMessage(
+                        "Screen Translator",
+                        "Overlay startup failed once. Retrying with current settings.",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        3500,
+                    )
+                    try:
+                        self._overlay = OverlayWindow(self._config)
+                    except Exception as e2:
+                        print(f"[Overlay] Retry create overlay failed: {e2}", flush=True)
+                        self._tray.showMessage(
+                            "Screen Translator",
+                            "Overlay failed to start. Check logs in %APPDATA%\\ScreenTranslator\\logs.",
+                            QSystemTrayIcon.MessageIcon.Critical,
+                            5000,
+                        )
+                        return
 
-        if self._overlay.isVisible():
-            self._overlay.hide()
-        else:
-            self._overlay.show()
-            self._overlay.activateWindow()
+            if self._overlay.isVisible():
+                self._overlay.hide()
+            else:
+                self._overlay.show()
+                self._overlay.activateWindow()
+        except Exception:
+            print("[Overlay] Unexpected toggle failure", flush=True)
+            traceback.print_exc()
+            self._overlay = None
+            if self._tray is not None:
+                self._tray.showMessage(
+                    "Screen Translator",
+                    "Overlay crashed while toggling. Please check logs.",
+                    QSystemTrayIcon.MessageIcon.Critical,
+                    5000,
+                )
 
     def _toggle_freeze(self):
         """Toggle freeze/manual mode on the active overlay."""
@@ -742,19 +1093,29 @@ class ScreenTranslatorApp:
                 was_visible = self._overlay.isVisible()
                 geo = self._overlay.geometry()
                 self._overlay.close()
-                self._overlay = OverlayWindow(self._config)
+                try:
+                    self._overlay = OverlayWindow(self._config)
+                except Exception as e:
+                    print(f"[Overlay] Failed to apply new settings: {e}", flush=True)
+                    self._tray.showMessage(
+                        "Screen Translator",
+                        "Failed to apply new settings. Keeping your selected backend.",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        3500,
+                    )
+                    self._overlay = OverlayWindow(self._config)
                 self._overlay.setGeometry(geo)
                 if was_visible:
                     self._overlay.show()
 
     def _on_tray_activated(self, reason):
         """Handle tray icon activation."""
-        try:
-            if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-                self._toggle_overlay()
-        except TypeError:
-            # PyQt6 C++ enum conversion issue - just toggle on any activation
-            self._toggle_overlay()
+        print(f"[Tray] Activated: {reason}", flush=True)
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._safe_call(self._toggle_overlay, "tray-activate")
 
     def _quit(self):
         """Quit the application."""
@@ -771,6 +1132,10 @@ class ScreenTranslatorApp:
 
 
 def main():
+    mp.freeze_support()
+    if not _acquire_single_instance_lock():
+        print("[Startup] Another instance is already running.", flush=True)
+        return
     # Ensure high DPI scaling
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

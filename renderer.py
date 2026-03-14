@@ -173,14 +173,16 @@ class TextRenderer:
             trans_text = item["text"]
 
             # Background
-            bg = QColor(255, 255, 255, 240)
+            bg = QColor(self._bg_color)
+            if bg.alpha() == 255:
+                bg.setAlpha(240)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(bg))
             painter.drawRoundedRect(rect, 4, 4)
 
             # Text
             painter.setFont(font)
-            painter.setPen(QPen(QColor(0, 0, 0)))
+            painter.setPen(QPen(QColor(self._text_color)))
             painter.drawText(
                 rect,
                 Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
