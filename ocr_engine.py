@@ -6,6 +6,7 @@ warnings.filterwarnings("ignore", message=".*pin_memory.*", category=UserWarning
 from dataclasses import dataclass
 import sys
 import asyncio
+import re
 from pathlib import Path
 import numpy as np
 from native_probe import probe_rapidocr
@@ -37,6 +38,107 @@ BACKEND_PADDLEOCR = "paddleocr"
 BACKEND_WINRT = "winrt"
 BACKEND_EASYOCR = "easyocr"
 BACKEND_NONE = "none"
+
+
+def _runtime_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resolve_runtime_path(path_str: str | None) -> Path | None:
+    raw = str(path_str or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = _runtime_base_dir() / path
+    return path.resolve()
+
+
+def _discover_paddle_model_dirs(lang: str, config: dict | None = None) -> dict[str, str]:
+    cfg = config or {}
+    explicit = {
+        "text_detection_model_dir": str(cfg.get("paddle_text_detection_model_dir", "") or "").strip(),
+        "text_recognition_model_dir": str(cfg.get("paddle_text_recognition_model_dir", "") or "").strip(),
+        "textline_orientation_model_dir": str(cfg.get("paddle_textline_orientation_model_dir", "") or "").strip(),
+    }
+
+    resolved: dict[str, str] = {}
+    for key, value in explicit.items():
+        path = _resolve_runtime_path(value)
+        if path and path.exists():
+            resolved[key] = str(path)
+
+    root = _resolve_runtime_path(cfg.get("paddle_model_root", ".models/paddleocr"))
+    if root is None or not root.exists():
+        return resolved
+
+    normalized_lang = _normalize_ocr_lang(lang)
+    rec_candidates = {
+        "ko": ["korean_PP-OCRv5_mobile_rec"],
+        "ja": ["PP-OCRv5_server_rec", "japan_PP-OCRv5_mobile_rec"],
+        "ja-jp": ["PP-OCRv5_server_rec", "japan_PP-OCRv5_mobile_rec"],
+        "zh": ["PP-OCRv5_server_rec", "ch_PP-OCRv5_mobile_rec"],
+        "zh-cn": ["PP-OCRv5_server_rec", "ch_PP-OCRv5_mobile_rec"],
+        "zh-tw": ["PP-OCRv5_server_rec", "chinese_cht_PP-OCRv5_mobile_rec"],
+        "en": ["en_PP-OCRv5_mobile_rec", "PP-OCRv5_server_rec"],
+    }.get(normalized_lang, ["en_PP-OCRv5_mobile_rec", "PP-OCRv5_server_rec"])
+
+    det_candidates = ["PP-OCRv5_server_det", "PP-OCRv4_mobile_det", "PP-OCRv3_mobile_det"]
+    cls_candidates = ["PP-LCNet_x1_0_doc_ori"]
+
+    if "text_detection_model_dir" not in resolved:
+        for name in det_candidates:
+            candidate = root / name
+            if candidate.exists():
+                resolved["text_detection_model_dir"] = str(candidate.resolve())
+                break
+    if "text_recognition_model_dir" not in resolved:
+        for name in rec_candidates:
+            candidate = root / name
+            if candidate.exists():
+                resolved["text_recognition_model_dir"] = str(candidate.resolve())
+                break
+    if "textline_orientation_model_dir" not in resolved:
+        for name in cls_candidates:
+            candidate = root / name
+            if candidate.exists():
+                resolved["textline_orientation_model_dir"] = str(candidate.resolve())
+                break
+
+    return resolved
+
+
+def _has_local_paddle_bundle(lang: str, config: dict | None = None) -> bool:
+    dirs = _discover_paddle_model_dirs(lang, config)
+    return bool(dirs.get("text_detection_model_dir")) and bool(dirs.get("text_recognition_model_dir"))
+
+
+def _normalize_ocr_lang(lang: str) -> str:
+    return str(lang or "").strip().lower()
+
+
+def _is_complex_script_source(lang: str) -> bool:
+    code = _normalize_ocr_lang(lang)
+    return code in {"ja", "ja-jp", "zh", "zh-cn", "zh-tw", "ko"}
+
+
+def _count_script_chars(text: str) -> dict[str, int]:
+    content = str(text or "")
+    return {
+        "latin": len(re.findall(r"[A-Za-z]", content)),
+        "kana": len(re.findall(r"[\u3040-\u30ff]", content)),
+        "hangul": len(re.findall(r"[\uac00-\ud7a3]", content)),
+        "han": len(re.findall(r"[\u4e00-\u9fff]", content)),
+    }
+
+
+def _is_symbol_only_text(text: str) -> bool:
+    content = str(text or "").strip()
+    if not content:
+        return True
+    return re.search(r"[A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7a3]", content) is None
 
 
 def _dedupe_keep_order(values: list[str]) -> list[str]:
@@ -407,6 +509,10 @@ class _WinRTEngine(_BaseEngine):
     def __init__(self, lang: str):
         self._requested_lang_tag = str(lang or "en").strip()
         self._lang_tag = self._requested_lang_tag
+        self._requested_lang_base = self._requested_lang_tag.split("-")[0].lower()
+        self._selected_lang_base = self._requested_lang_base
+        self._mismatch_mode = False
+        self._bad_script_warned = False
         self._engine = None
         self._imaging = None
         self._streams = None
@@ -493,6 +599,8 @@ class _WinRTEngine(_BaseEngine):
                 continue
             self._engine = engine
             self._lang_tag = candidate
+            self._selected_lang_base = str(candidate).split("-")[0].lower()
+            self._mismatch_mode = self._selected_lang_base != requested_base
             if candidate.lower() != requested.lower():
                 print(
                     f"[OCR] WinRT language fallback: requested='{requested}' using='{candidate}'",
@@ -586,6 +694,29 @@ class _WinRTEngine(_BaseEngine):
             bbox = [[x, y], [x + w0, y], [x + w0, y + h0], [x, y + h0]]
             text = line.text or ""
             blocks.append(TextBlock(text=text, bbox=bbox, confidence=1.0))
+
+        if self._mismatch_mode and self._requested_lang_base in {"ja", "ko", "zh"}:
+            merged_text = " ".join(b.text for b in blocks if b.text).strip()
+            counts = _count_script_chars(merged_text)
+            if self._requested_lang_base == "ja":
+                script_hits = counts["kana"] + counts["han"]
+            elif self._requested_lang_base == "ko":
+                script_hits = counts["hangul"]
+            else:
+                script_hits = counts["han"]
+
+            # When Japanese/Korean/Chinese OCR falls back to an English recognizer,
+            # WinRT can emit Latin-looking transliteration instead of the original script.
+            # Reject that result so we do not send obvious garbage into translation.
+            if blocks and script_hits == 0 and counts["latin"] >= 3:
+                if not self._bad_script_warned:
+                    print(
+                        "[OCR] WinRT mismatch produced Latin text for a non-Latin source. "
+                        "Rejecting result; install the matching Windows OCR language pack.",
+                        flush=True,
+                    )
+                    self._bad_script_warned = True
+                return []
         return blocks
 
 
@@ -596,12 +727,24 @@ class _RapidEngine(_BaseEngine):
         self._lang = lang
         self._config = config or {}
         self._rapid = None
-        self._quality_retry_enabled = bool(self._config.get("rapid_quality_retry", False))
+        complex_script_source = _is_complex_script_source(lang)
+        self._quality_retry_enabled = (
+            bool(self._config.get("rapid_quality_retry", False)) or complex_script_source
+        )
         self._joined_ratio_threshold = float(self._config.get("rapid_joined_ratio_threshold", 0.35))
         self._quality_score_margin = float(self._config.get("rapid_quality_margin", 0.03))
         ok, reason = probe_rapidocr(timeout_sec=8.0)
         if not ok:
             print(f"[OCR] RapidOCR probe failed: {reason}", flush=True)
+            if not getattr(sys, "frozen", False):
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+
+                    self._rapid = RapidOCR()
+                    print("[OCR] RapidOCR direct init succeeded after probe failure", flush=True)
+                    return
+                except Exception as exc:
+                    print(f"[OCR] RapidOCR direct init also failed: {exc}", flush=True)
             print("[OCR] RapidOCR disabled to prevent native crash; using fallback backends.", flush=True)
             return
         try:
@@ -753,8 +896,9 @@ class _RapidEngine(_BaseEngine):
 class _PaddleEngine(_BaseEngine):
     """Fallback engine using paddleocr if installed (usually slower than rapid)."""
 
-    def __init__(self, lang: str):
+    def __init__(self, lang: str, config: dict | None = None):
         self._lang = lang
+        self._config = config or {}
         self._model = None
         self._error_count = 0          # consecutive error counter
         self._disabled = False         # permanently disabled after too many errors
@@ -763,11 +907,36 @@ class _PaddleEngine(_BaseEngine):
             # Bypass network connectivity check (PaddleOCR 3.x)
             os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
             from paddleocr import PaddleOCR
-            paddle_lang = "korean" if lang.startswith("ko") else "en"
+            normalized_lang = _normalize_ocr_lang(lang)
+            paddle_lang = {
+                "ko": "korean",
+                "ja": "japan",
+                "ja-jp": "japan",
+                "zh": "ch",
+                "zh-cn": "ch",
+                "zh-tw": "chinese_cht",
+            }.get(normalized_lang, "en")
+            local_model_dirs = _discover_paddle_model_dirs(lang, self._config)
+            if local_model_dirs:
+                print(
+                    "[OCR] PaddleOCR local model dirs: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(local_model_dirs.items())),
+                    flush=True,
+                )
+            common_kwargs = {
+                "lang": paddle_lang,
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+                "device": str(self._config.get("paddle_device", "cpu") or "cpu"),
+                "enable_mkldnn": bool(self._config.get("paddle_enable_mkldnn", False)),
+                "cpu_threads": int(self._config.get("paddle_cpu_threads", 2) or 2),
+                **local_model_dirs,
+            }
             # PaddleOCR 3.x removed show_log; try with, then without
             for kwargs in [
-                {"lang": paddle_lang, "use_angle_cls": False},
-                {"lang": paddle_lang},
+                common_kwargs,
+                local_model_dirs,
                 {},
             ]:
                 try:
@@ -825,12 +994,41 @@ class _PaddleEngine(_BaseEngine):
                     # maybe v3.x wraps differently — fall through to attribute access
                     raise ValueError("unexpected format")
             else:
-                # PaddleOCR 3.x format: results is list of Result-like objects
+                # PaddleOCR 3.x format: results is list of dict-like OCRResult objects
                 for page in (results or []):
+                    page_res = None
+                    if hasattr(page, "get"):
+                        page_res = page.get("res")
+                    if not page_res and hasattr(page, "json"):
+                        try:
+                            page_res = page.json.get("res")
+                        except Exception:
+                            page_res = None
+
+                    if page_res:
+                        texts = page_res.get("rec_texts") or []
+                        scores = page_res.get("rec_scores") or []
+                        polys = page_res.get("rec_polys") or page_res.get("dt_polys") or []
+                        for bbox, text, conf in zip(polys, texts, scores):
+                            try:
+                                conf_val = float(conf)
+                            except Exception:
+                                conf_val = 0.0
+                            if conf_val >= min_confidence and str(text).strip() and not _is_symbol_only_text(text):
+                                bbox_list = [[float(p[0]), float(p[1])] for p in bbox]
+                                blocks.append(
+                                    TextBlock(
+                                        text=str(text).strip(),
+                                        bbox=bbox_list,
+                                        confidence=conf_val,
+                                    )
+                                )
+                        continue
+
                     page_results = getattr(page, "rec_res", None) or getattr(page, "get", lambda k, d=None: None)("rec_res") or []
                     bboxes = getattr(page, "dt_boxes", []) or []
                     for bbox, (text, conf) in zip(bboxes, page_results):
-                        if conf >= min_confidence and text.strip():
+                        if conf >= min_confidence and text.strip() and not _is_symbol_only_text(text):
                             bbox_list = [[float(p[0]), float(p[1])] for p in bbox]
                             blocks.append(TextBlock(text=text.strip(), bbox=bbox_list, confidence=conf))
         except Exception as e:
@@ -846,17 +1044,61 @@ def _avg_confidence(blocks: list[TextBlock]) -> float:
     return sum(b.confidence for b in blocks) / len(blocks)
 
 
+def _blocks_script_counts(blocks: list[TextBlock]) -> dict[str, int]:
+    total = {"latin": 0, "kana": 0, "hangul": 0, "han": 0}
+    for block in blocks or []:
+        counts = _count_script_chars(getattr(block, "text", ""))
+        for key in total:
+            total[key] += counts.get(key, 0)
+    return total
+
+
+def _crop_block(block: TextBlock, image_shape: tuple[int, ...], pad_x: int, pad_y: int) -> tuple[int, int, int, int]:
+    h, w = image_shape[:2]
+    x1 = max(0, int(block.x) - pad_x)
+    y1 = max(0, int(block.y) - pad_y)
+    x2 = min(w, int(block.x + block.width) + pad_x)
+    y2 = min(h, int(block.y + block.height) + pad_y)
+    return x1, y1, x2, y2
+
+
+def _offset_block(block: TextBlock, dx: int, dy: int) -> TextBlock:
+    bbox = [[float(x) + dx, float(y) + dy] for x, y in block.bbox]
+    return TextBlock(text=block.text, bbox=bbox, confidence=block.confidence)
+
+
+def _shift_block(block: TextBlock, dx: float, dy: float = 0.0) -> TextBlock:
+    bbox = [[float(x) + dx, float(y) + dy] for x, y in block.bbox]
+    return TextBlock(text=block.text, bbox=bbox, confidence=block.confidence)
+
+
 def _make_engine(name: str, lang: str, config: dict | None = None) -> "_BaseEngine | None":
     """Instantiate and return a backend engine by name, or None if unavailable."""
     if name == BACKEND_RAPIDOCR:
         e = _RapidEngine(lang, config=config)
         return e if e._rapid is not None else None
     if name == BACKEND_PADDLEOCR:
-        e = _PaddleEngine(lang)
+        e = _PaddleEngine(lang, config=config)
         return e if e._model is not None else None
     if name == BACKEND_WINRT:
         e = _WinRTEngine(lang)
-        return e if e._engine is not None else None
+        if e._engine is None:
+            return None
+        allow_mismatch = bool((config or {}).get("allow_winrt_mismatch_fallback", False))
+        # If WinRT falls back to another base language (e.g. ja -> en),
+        # OCR quality can collapse for CJK text. Prefer other OCR backends.
+        if e._requested_lang_base in {"ja", "ko", "zh"} and e._selected_lang_base != e._requested_lang_base:
+            if not allow_mismatch:
+                print(
+                    f"[OCR] WinRT language mismatch: requested='{e._requested_lang_base}' got='{e._selected_lang_base}'. Skipping WinRT.",
+                    flush=True,
+                )
+                return None
+            print(
+                f"[OCR] WinRT language mismatch: requested='{e._requested_lang_base}' got='{e._selected_lang_base}'. Using fallback mode.",
+                flush=True,
+            )
+        return e
     if name == BACKEND_EASYOCR:
         e = _EasyOCREngine(lang)
         e._ensure_reader()
@@ -886,6 +1128,7 @@ class OCREngine:
         self._fallback: _BaseEngine | None = None
         self._primary_name: str = BACKEND_NONE
         self._fallback_name: str = BACKEND_NONE
+        self._deferred_fallback_name: str = BACKEND_NONE
         self._confidence_thresh: float = self._config.get("confidence_thresh", 0.75)
         self._select_backends()
 
@@ -896,38 +1139,47 @@ class OCREngine:
 
         Default cascade (when winrt_enabled=True):  WinRT → RapidOCR → EasyOCR
         Default cascade (when winrt_enabled=False): RapidOCR → EasyOCR
-        PaddleOCR is NOT in any auto-cascade (broken oneDNN on most systems).
+        If bundled PaddleOCR models are available, CJK sources can promote
+        PaddleOCR to avoid WinRT/language-pack dependencies.
         """
         self._primary = None
         self._fallback = None
         self._primary_name = BACKEND_NONE
         self._fallback_name = BACKEND_NONE
+        self._deferred_fallback_name = BACKEND_NONE
         self._confidence_thresh = self._config.get("confidence_thresh", 0.75)
 
         wanted_primary  = self._config.get("primary_backend",  BACKEND_RAPIDOCR)
         wanted_fallback = self._config.get("fallback_backend", BACKEND_NONE)
         winrt_ok   = self._config.get("winrt_enabled",   False)
         easyocr_ok = self._config.get("easyocr_enabled", False)
+        paddle_ok = bool(self._config.get("paddleocr_enabled", False)) and _has_local_paddle_bundle(
+            self._source_language, self._config
+        )
+        complex_script_source = _is_complex_script_source(self._source_language)
         frozen_safe_boot = getattr(sys, "frozen", False) and bool(
             self._config.get("safe_boot_native", True)
         )
 
         if frozen_safe_boot:
-            # Packaged safe mode: force WinRT-only OCR path to avoid native DLL crashes.
-            winrt_ok = True
+            # Packaged safe mode should stay self-contained:
+            # prefer bundled OCR libs and avoid OS language-pack dependencies.
+            winrt_ok = False
             easyocr_ok = False
-            if wanted_primary != BACKEND_WINRT:
+            safe_primary = BACKEND_PADDLEOCR if (complex_script_source and paddle_ok) else BACKEND_RAPIDOCR
+            if wanted_primary != safe_primary:
                 print(
-                    f"[SafeBoot] OCR primary '{wanted_primary}' -> '{BACKEND_WINRT}'",
+                    f"[SafeBoot] OCR primary '{wanted_primary}' -> '{safe_primary}'",
                     flush=True,
                 )
-            wanted_primary = BACKEND_WINRT
-            if wanted_fallback != BACKEND_NONE:
+            wanted_primary = safe_primary
+            safe_fallback = BACKEND_RAPIDOCR if safe_primary == BACKEND_PADDLEOCR else BACKEND_NONE
+            if wanted_fallback != safe_fallback:
                 print(
-                    f"[SafeBoot] OCR fallback '{wanted_fallback}' disabled in packaged mode",
+                    f"[SafeBoot] OCR fallback '{wanted_fallback}' -> '{safe_fallback}' in packaged mode",
                     flush=True,
                 )
-            wanted_fallback = BACKEND_NONE
+            wanted_fallback = safe_fallback
 
         # Respect opt-in guards
         if wanted_primary == BACKEND_WINRT and not winrt_ok:
@@ -935,11 +1187,42 @@ class OCREngine:
             wanted_primary = BACKEND_RAPIDOCR
         if wanted_primary == BACKEND_EASYOCR and not easyocr_ok:
             wanted_primary = BACKEND_RAPIDOCR
+        if wanted_primary == BACKEND_PADDLEOCR and not paddle_ok:
+            print("[OCR] PaddleOCR requested but local bundled models are missing - skipping", flush=True)
+            wanted_primary = BACKEND_RAPIDOCR
 
         if wanted_fallback == BACKEND_WINRT and not winrt_ok:
             wanted_fallback = BACKEND_NONE
         if wanted_fallback == BACKEND_EASYOCR and not easyocr_ok:
             wanted_fallback = BACKEND_NONE
+        if wanted_fallback == BACKEND_PADDLEOCR and not paddle_ok:
+            wanted_fallback = BACKEND_NONE
+
+        # UX assist for non-Latin scripts: keep fast OCR as primary, and use
+        # bundled PaddleOCR only as a targeted fallback when RapidOCR is not useful.
+        if (
+            complex_script_source
+            and wanted_primary == BACKEND_RAPIDOCR
+            and paddle_ok
+            and wanted_fallback == BACKEND_NONE
+        ):
+            wanted_fallback = BACKEND_PADDLEOCR
+            print(
+                "[OCR] Script assist: enabling PaddleOCR fallback for non-Latin text",
+                flush=True,
+            )
+        elif (
+            complex_script_source
+            and not frozen_safe_boot
+            and wanted_primary == BACKEND_RAPIDOCR
+            and wanted_fallback in {BACKEND_NONE, BACKEND_PADDLEOCR}
+        ):
+            wanted_fallback = BACKEND_WINRT
+            winrt_ok = True
+            print(
+                "[OCR] Script assist: enabling WinRT fallback for non-Latin text",
+                flush=True,
+            )
 
         # ── Load primary ──────────────────────────────────────────────
         engine = _make_engine(wanted_primary, self._source_language, self._config)
@@ -951,9 +1234,11 @@ class OCREngine:
             # Auto-cascade: WinRT → RapidOCR → EasyOCR  (no PaddleOCR)
             print(f"[OCR] Primary '{wanted_primary}' unavailable — cascade", flush=True)
             cascade = []
+            if paddle_ok and complex_script_source:
+                cascade.append(BACKEND_PADDLEOCR)
             if winrt_ok:
                 cascade.append(BACKEND_WINRT)
-            if not frozen_safe_boot:
+            if (not frozen_safe_boot) or complex_script_source:
                 cascade.append(BACKEND_RAPIDOCR)
             if easyocr_ok:
                 cascade.append(BACKEND_EASYOCR)
@@ -970,25 +1255,28 @@ class OCREngine:
         # ── Load fallback (different from primary) ────────────────────
         if (wanted_fallback
                 and wanted_fallback != BACKEND_NONE
-                and wanted_fallback != BACKEND_PADDLEOCR   # skip broken paddle
                 and wanted_fallback != self._primary_name):
-            fe = _make_engine(wanted_fallback, self._source_language, self._config)
-            if fe is not None:
-                self._fallback      = fe
+            if wanted_fallback == BACKEND_PADDLEOCR:
                 self._fallback_name = wanted_fallback
-                print(f"[OCR] Fallback backend: {wanted_fallback}", flush=True)
+                self._deferred_fallback_name = wanted_fallback
+                print(f"[OCR] Fallback backend deferred: {wanted_fallback}", flush=True)
             else:
-                print(f"[OCR] Fallback '{wanted_fallback}' unavailable", flush=True)
-        elif wanted_fallback == BACKEND_PADDLEOCR:
-            print("[OCR] PaddleOCR skipped (broken oneDNN)", flush=True)
+                fe = _make_engine(wanted_fallback, self._source_language, self._config)
+                if fe is not None:
+                    self._fallback      = fe
+                    self._fallback_name = wanted_fallback
+                    print(f"[OCR] Fallback backend: {wanted_fallback}", flush=True)
+                else:
+                    print(f"[OCR] Fallback '{wanted_fallback}' unavailable", flush=True)
 
         # Emergency fallback for packaged/runtime DLL mismatch cases.
         if self._primary is None:
-            emergency_order = (
-                [BACKEND_WINRT]
-                if frozen_safe_boot
-                else [BACKEND_WINRT, BACKEND_EASYOCR]
-            )
+            emergency_order = []
+            if paddle_ok and complex_script_source:
+                emergency_order.append(BACKEND_PADDLEOCR)
+            emergency_order.extend([BACKEND_WINRT, BACKEND_RAPIDOCR])
+            if easyocr_ok:
+                emergency_order.append(BACKEND_EASYOCR)
             for name in emergency_order:
                 if name == self._primary_name:
                     continue
@@ -1031,6 +1319,239 @@ class OCREngine:
     def fallback_name(self) -> str:
         return self._fallback_name
 
+    def _is_wide_cjk_strip(self, image: np.ndarray) -> bool:
+        if image is None or image.size == 0:
+            return False
+        h, w = image.shape[:2]
+        if h <= 0 or w <= 0:
+            return False
+        return _is_complex_script_source(self._source_language) and (w / max(h, 1)) >= 4.5 and h <= 220
+
+    def _detect_tiled_horizontal(self, image: np.ndarray, min_confidence: float = 0.3) -> list[TextBlock]:
+        if self._primary is None:
+            return []
+        h, w = image.shape[:2]
+        tile_width = max(int(w * 0.42), 220)
+        stride = max(int(tile_width * 0.72), 120)
+        starts: list[int] = []
+        x = 0
+        while x < w:
+            starts.append(x)
+            if x + tile_width >= w:
+                break
+            x += stride
+
+        collected: list[TextBlock] = []
+        for start_x in starts:
+            end_x = min(w, start_x + tile_width)
+            tile = image[:, start_x:end_x, :]
+            tile_blocks = self._primary.detect(tile, min_confidence)
+            for block in tile_blocks:
+                collected.append(_shift_block(block, start_x, 0.0))
+
+        if not collected:
+            return []
+
+        collected.sort(key=lambda b: (b.y, b.x))
+        deduped: list[TextBlock] = []
+        for block in collected:
+            duplicate = False
+            for prev in deduped[-8:]:
+                same_text = prev.text.strip() == block.text.strip()
+                close_x = abs(prev.x - block.x) <= max(12, int(min(prev.width, block.width) * 0.18))
+                close_y = abs(prev.y - block.y) <= max(8, int(min(prev.height, block.height) * 0.25))
+                if same_text and close_x and close_y:
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append(block)
+        return deduped
+
+    def _should_try_complex_fallback(self, primary_blocks: list[TextBlock], image: np.ndarray) -> bool:
+        if self._fallback_name != BACKEND_PADDLEOCR:
+            return False
+        if not _is_complex_script_source(self._source_language):
+            return False
+        h, w = image.shape[:2]
+        pixel_count = int(h * w)
+        if pixel_count > 700_000:
+            return False
+        if not primary_blocks:
+            return True
+        counts = _blocks_script_counts(primary_blocks)
+        non_latin = counts["kana"] + counts["hangul"] + counts["han"]
+        latin = counts["latin"]
+        avg_conf = _avg_confidence(primary_blocks)
+        if non_latin == 0 and latin >= 4 and avg_conf < 0.88 and len(primary_blocks) <= 8:
+            return True
+        if len(primary_blocks) <= 2 and avg_conf < 0.72:
+            return True
+        joined_text = " ".join(getattr(b, "text", "") for b in primary_blocks)
+        suspicious_chars = len(re.findall(r"[卜羲释实尧樸磨]", joined_text))
+        if (
+            counts["han"] >= 24
+            and counts["kana"] >= 4
+            and len(primary_blocks) >= 5
+            and avg_conf < 0.82
+            and suspicious_chars >= 3
+            and pixel_count <= 420_000
+        ):
+            return True
+        return False
+
+    def _should_rescue_block(self, block: TextBlock) -> bool:
+        text = str(getattr(block, "text", "") or "").strip()
+        if not text:
+            return True
+        counts = _count_script_chars(text)
+        suspicious_chars = len(re.findall(r"[卜羲释实尧樸磨]", text))
+
+        if self._source_language in {"ja", "ja-jp"}:
+            if counts["kana"] == 0 and counts["han"] >= 2:
+                return True
+            if suspicious_chars >= 1:
+                return True
+        elif self._source_language in {"zh", "zh-cn", "zh-tw"}:
+            if suspicious_chars >= 1:
+                return True
+        elif self._source_language == "ko":
+            if counts["hangul"] == 0 and counts["han"] >= 2:
+                return True
+
+        non_latin = counts["kana"] + counts["hangul"] + counts["han"]
+        if non_latin == 0 and counts["latin"] >= max(4, len(text) // 2):
+            return True
+        if getattr(block, "confidence", 0.0) < 0.72 and len(text) <= 24:
+            return True
+        return False
+
+    def _rescue_suspicious_regions(
+        self,
+        image: np.ndarray,
+        primary_blocks: list[TextBlock],
+        min_confidence: float,
+    ) -> list[TextBlock]:
+        if not primary_blocks:
+            return primary_blocks
+
+        line_blocks = merge_same_line_blocks(primary_blocks)
+        suspicious_lines = [block for block in line_blocks if self._should_rescue_block(block)]
+        if not suspicious_lines:
+            return primary_blocks
+
+        suspicious_lines.sort(key=lambda b: (b.y, b.x))
+        max_lines_per_region = int(self._config.get("paddle_region_rescue_max_lines_per_region", 2) or 2)
+        regions: list[TextBlock] = []
+        current: list[TextBlock] = []
+        for block in suspicious_lines:
+            if not current:
+                current = [block]
+                continue
+            prev = current[-1]
+            close_y = (block.y - (prev.y + prev.height)) <= max(14, int(max(prev.height, block.height) * 0.95))
+            overlap = _horizontal_overlap_ratio(prev, block) >= 0.18
+            if len(current) < max_lines_per_region and close_y and overlap:
+                current.append(block)
+                continue
+            regions.append(_merge_paragraph_group(current))
+            current = [block]
+        if current:
+            regions.append(_merge_paragraph_group(current))
+
+        max_regions = int(self._config.get("paddle_region_rescue_max_regions", 4) or 4)
+        if len(regions) > max_regions:
+            print(
+                f"[OCR] Region rescue skipped: suspicious_regions={len(regions)} exceeds limit={max_regions}",
+                flush=True,
+            )
+            return primary_blocks
+
+        if not self._ensure_fallback_loaded():
+            return primary_blocks
+
+        replacements: list[tuple[TextBlock, list[TextBlock]]] = []
+        for block in regions:
+            pad_x = max(16, int(block.height * 1.1))
+            pad_y = max(10, int(block.height * 0.55))
+            x1, y1, x2, y2 = _crop_block(block, image.shape, pad_x=pad_x, pad_y=pad_y)
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            fallback_blocks = self._fallback.detect(crop, min_confidence)
+            if not fallback_blocks:
+                continue
+
+            shifted = [_offset_block(b, x1, y1) for b in fallback_blocks]
+            fallback_text = " ".join(b.text for b in shifted).strip()
+            primary_text = str(block.text or "").strip()
+            fallback_counts = _count_script_chars(fallback_text)
+            primary_counts = _count_script_chars(primary_text)
+            fallback_non_latin = fallback_counts["kana"] + fallback_counts["hangul"] + fallback_counts["han"]
+            primary_non_latin = primary_counts["kana"] + primary_counts["hangul"] + primary_counts["han"]
+            fallback_conf = _avg_confidence(shifted)
+            primary_conf = float(getattr(block, "confidence", 0.0))
+
+            is_better = (
+                fallback_non_latin > primary_non_latin
+                or len(fallback_text) >= max(len(primary_text) + 4, int(len(primary_text) * 1.25))
+                or fallback_conf > primary_conf + 0.10
+            )
+            if not is_better:
+                continue
+
+            print(
+                f"[OCR] Region rescue accepted: '{primary_text[:28]}' -> '{fallback_text[:40]}'",
+                flush=True,
+            )
+            replacements.append((block, shifted))
+
+        if not replacements:
+            print("[OCR] Region rescue kept primary blocks", flush=True)
+            return primary_blocks
+
+        rescued_blocks: list[TextBlock] = []
+        for block in line_blocks:
+            matched = None
+            for source_block, replacement in replacements:
+                overlap_x1 = max(block.x, source_block.x)
+                overlap_y1 = max(block.y, source_block.y)
+                overlap_x2 = min(block.x + block.width, source_block.x + source_block.width)
+                overlap_y2 = min(block.y + block.height, source_block.y + source_block.height)
+                if overlap_x2 > overlap_x1 and overlap_y2 > overlap_y1:
+                    matched = replacement
+                    break
+            if matched is None:
+                rescued_blocks.append(block)
+
+        for _, replacement in replacements:
+            rescued_blocks.extend(replacement)
+
+        rescued_blocks.sort(key=lambda b: (b.y, b.x))
+        print(
+            f"[OCR] Region rescue merged {len(replacements)} suspicious line(s) -> total_blocks={len(rescued_blocks)}",
+            flush=True,
+        )
+        return rescued_blocks
+
+    def _ensure_fallback_loaded(self) -> bool:
+        if self._fallback is not None:
+            return True
+        if self._fallback_name == BACKEND_NONE:
+            return False
+        if self._deferred_fallback_name == BACKEND_NONE:
+            return False
+        print(f"[OCR] Loading deferred fallback: {self._deferred_fallback_name}", flush=True)
+        fe = _make_engine(self._deferred_fallback_name, self._source_language, self._config)
+        if fe is None:
+            print(f"[OCR] Deferred fallback unavailable: {self._deferred_fallback_name}", flush=True)
+            self._deferred_fallback_name = BACKEND_NONE
+            return False
+        self._fallback = fe
+        print(f"[OCR] Fallback backend ready: {self._deferred_fallback_name}", flush=True)
+        self._deferred_fallback_name = BACKEND_NONE
+        return True
+
     def detect(self, image: np.ndarray, min_confidence: float = 0.3) -> list[TextBlock]:
         """
         Run OCR using primary backend.
@@ -1047,14 +1568,40 @@ class OCREngine:
             avg = sum(b.confidence for b in primary_blocks) / len(primary_blocks)
             print(f"[OCR] {self._primary_name} conf={avg:.2f}  blocks={len(primary_blocks)}", flush=True)
 
-        # Only fall back when primary found nothing at all
-        if not primary_blocks and self._fallback is not None:
-            print(f"[OCR] No blocks → fallback ({self._fallback_name})", flush=True)
+        if self._primary_name == BACKEND_RAPIDOCR and self._is_wide_cjk_strip(image):
+            tiled_blocks = self._detect_tiled_horizontal(image, min_confidence)
+            if tiled_blocks:
+                tiled_avg = _avg_confidence(tiled_blocks)
+                primary_avg = _avg_confidence(primary_blocks)
+                if (
+                    len(tiled_blocks) > len(primary_blocks)
+                    or (len(tiled_blocks) == len(primary_blocks) and tiled_avg > primary_avg + 0.03)
+                ):
+                    print(
+                        f"[OCR] RapidOCR tiled pass accepted ({len(primary_blocks)} -> {len(tiled_blocks)} blocks)",
+                        flush=True,
+                    )
+                    primary_blocks = tiled_blocks
+
+        should_fallback = self._should_try_complex_fallback(primary_blocks, image)
+        if should_fallback and primary_blocks:
+            print(
+                f"[OCR] Primary blocks look weak for '{self._source_language}' -> fallback ({self._fallback_name})",
+                flush=True,
+            )
+
+        # Only fall back on the full image when primary found nothing at all.
+        if not primary_blocks and self._ensure_fallback_loaded():
+            print(f"[OCR] No blocks -> fallback ({self._fallback_name})", flush=True)
             fallback_blocks = self._fallback.detect(image, min_confidence)
             if fallback_blocks:
                 avg = sum(b.confidence for b in fallback_blocks) / len(fallback_blocks)
                 print(f"[OCR] {self._fallback_name} conf={avg:.2f}  blocks={len(fallback_blocks)}", flush=True)
+                return fallback_blocks
             return fallback_blocks
+
+        if should_fallback and primary_blocks:
+            return self._rescue_suspicious_regions(image, primary_blocks, min_confidence)
 
         return primary_blocks
 

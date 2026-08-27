@@ -7,29 +7,65 @@ import traceback
 import threading
 import faulthandler
 import multiprocessing as mp
+import time
 from datetime import datetime
 from pathlib import Path
 
 
-def _setup_frozen_logging():
-    """Redirect stdout/stderr to AppData log file in packaged builds."""
-    if not getattr(sys, "frozen", False):
+class _TeeStream:
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        for stream in self._streams:
+            try:
+                stream.write(data)
+                stream.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        for stream in self._streams:
+            try:
+                if stream.isatty():
+                    return True
+            except Exception:
+                continue
+        return False
+
+
+def _setup_runtime_logging():
+    """Mirror stdout/stderr to a log file for packaged builds and opt-in dev runs."""
+    dev_log_opt = str(os.getenv("ST_LOG_TO_FILE", "1")).strip().lower()
+    want_dev_log = dev_log_opt not in {"0", "false", "no", "off"}
+    if not getattr(sys, "frozen", False) and not want_dev_log:
         return
     try:
-        appdata = os.getenv("APPDATA") or os.path.expanduser("~")
-        log_dir = os.path.join(appdata, "ScreenTranslator", "logs")
-        os.makedirs(log_dir, exist_ok=True)
+        if getattr(sys, "frozen", False):
+            appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+            log_dir = Path(appdata) / "ScreenTranslator" / "logs"
+        else:
+            log_dir = Path(__file__).resolve().parent / ".logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_path = os.path.join(log_dir, f"app-{timestamp}-p{os.getpid()}.log")
+        log_path = log_dir / f"app-{timestamp}-p{os.getpid()}.log"
         log_file = open(log_path, "w", encoding="utf-8", buffering=1)
-        sys.stdout = log_file
-        sys.stderr = log_file
+        sys.stdout = _TeeStream(sys.__stdout__, log_file)
+        sys.stderr = _TeeStream(sys.__stderr__, log_file)
         print(f"[Startup] Logging to {log_path}", flush=True)
     except Exception:
         pass
 
 
-_setup_frozen_logging()
+_setup_runtime_logging()
 
 
 def _install_global_exception_hooks():
@@ -64,16 +100,35 @@ def _install_global_exception_hooks():
 
 _install_global_exception_hooks()
 
-# Avoid eager torch import in packaged builds.
-# It can trigger native access violations on some machines before UI startup.
-if not getattr(sys, "frozen", False):
+AUTHOR_CREDIT_MESSAGE = (
+    "APP NÀY ĐƯỢC VIẾT BỞI BỐ HUY "
+    "https://github.com/Desired23/screen-translato"
+)
+
+
+def _preload_native_ocr_runtime():
+    """Preload onnxruntime/RapidOCR before PyQt6 to avoid DLL init conflicts."""
     try:
-        import torch  # noqa: F401
-    except Exception:
-        pass
+        import onnxruntime as ort
+
+        print(f"[Startup] Preloaded onnxruntime {ort.__version__}", flush=True)
+    except Exception as exc:
+        print(f"[Startup] onnxruntime preload failed: {exc}", flush=True)
+        return
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+
+        _ = RapidOCR
+        print("[Startup] Preloaded rapidocr_onnxruntime", flush=True)
+    except Exception as exc:
+        print(f"[Startup] RapidOCR preload failed: {exc}", flush=True)
+
+
+_preload_native_ocr_runtime()
 
 from pynput import keyboard as pynput_keyboard
-from PyQt6.QtCore import Qt, QTimer, qInstallMessageHandler
+from PyQt6.QtCore import Qt, QTimer, qInstallMessageHandler, QObject, pyqtSignal
 from PyQt6.QtGui import QIcon, QAction, QFont, QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -108,9 +163,13 @@ def _acquire_single_instance_lock() -> bool:
     if os.name != "nt":
         return True
     error_already_exists = 183
+    suffix_raw = str(os.getenv("ST_SINGLE_INSTANCE_SUFFIX", "")).strip()
+    safe_suffix = ""
+    if suffix_raw:
+        safe_suffix = "_" + "".join(ch for ch in suffix_raw if ch.isalnum() or ch in {"_", "-"})
     mutex_names = [
-        "Local\\ScreenTranslatorSingletonMutex",
-        "Global\\ScreenTranslatorSingletonMutex",
+        f"Local\\ScreenTranslatorSingletonMutex{safe_suffix}",
+        f"Global\\ScreenTranslatorSingletonMutex{safe_suffix}",
     ]
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = (
@@ -140,37 +199,224 @@ def _acquire_single_instance_lock() -> bool:
 
 # Source languages (for OCR - what's on screen)
 SOURCE_LANGUAGES = {
+    "auto": "Auto Detect",
     "en": "English",
-    "ko": "Korean",
     "ja": "Japanese",
+    "ko": "Korean",
     "zh-CN": "Chinese (Simplified)",
     "zh-TW": "Chinese (Traditional)",
-    "fr": "French",
-    "de": "German",
-    "es": "Spanish",
-    "th": "Thai",
-    "ru": "Russian",
-    "pt": "Portuguese",
-    "it": "Italian",
-    "ar": "Arabic",
 }
 # Target languages (translation output)
 TARGET_LANGUAGES = {
     "vi": "Vietnamese",
-    "en": "English",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "zh-CN": "Chinese (Simplified)",
-    "zh-TW": "Chinese (Traditional)",
-    "fr": "French",
-    "de": "German",
-    "es": "Spanish",
-    "th": "Thai",
-    "ru": "Russian",
-    "pt": "Portuguese",
-    "it": "Italian",
-    "ar": "Arabic",
 }
+
+
+class _HotkeyDispatcher(QObject):
+    toggle_overlay = pyqtSignal()
+    toggle_freeze = pyqtSignal()
+
+
+class _WindowsGlobalHotkeys:
+    WM_HOTKEY = 0x0312
+    WM_QUIT = 0x0012
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+
+    _KEY_MAP = {
+        "space": 0x20,
+        "tab": 0x09,
+        "enter": 0x0D,
+        "esc": 0x1B,
+        "escape": 0x1B,
+        "up": 0x26,
+        "down": 0x28,
+        "left": 0x25,
+        "right": 0x27,
+        "home": 0x24,
+        "end": 0x23,
+        "pageup": 0x21,
+        "pagedown": 0x22,
+        "insert": 0x2D,
+        "delete": 0x2E,
+    }
+
+    def __init__(self):
+        self._thread = None
+        self._thread_id = 0
+        self._callbacks: dict[int, callable] = {}
+        self._active_ids: list[int] = []
+        self._start_event = threading.Event()
+        self._start_ok = False
+        self._start_error = "not started"
+
+    @classmethod
+    def _parse_hotkey(cls, hotkey_str: str) -> tuple[int, int]:
+        parts = [p.strip().lower() for p in str(hotkey_str or "").split("+") if p.strip()]
+        if not parts:
+            raise ValueError("empty hotkey")
+
+        modifiers = 0
+        key_token = None
+        for token in parts:
+            if token in {"ctrl", "control"}:
+                modifiers |= cls.MOD_CONTROL
+            elif token == "shift":
+                modifiers |= cls.MOD_SHIFT
+            elif token == "alt":
+                modifiers |= cls.MOD_ALT
+            elif token in {"win", "meta"}:
+                modifiers |= cls.MOD_WIN
+            else:
+                key_token = token
+
+        if not key_token:
+            raise ValueError("missing key in hotkey")
+
+        if len(key_token) == 1:
+            ch = key_token.upper()
+            if "A" <= ch <= "Z" or "0" <= ch <= "9":
+                return modifiers, ord(ch)
+            raise ValueError(f"unsupported key: {key_token}")
+
+        if key_token.startswith("f") and key_token[1:].isdigit():
+            fnum = int(key_token[1:])
+            if 1 <= fnum <= 24:
+                return modifiers, 0x70 + (fnum - 1)
+
+        vk = cls._KEY_MAP.get(key_token)
+        if vk is None:
+            raise ValueError(f"unsupported key: {key_token}")
+        return modifiers, vk
+
+    def start(self, hotkey_defs: dict[int, tuple[str, callable]]) -> tuple[bool, str]:
+        self.stop()
+        self._callbacks = {hid: cb for hid, (_s, cb) in hotkey_defs.items()}
+        self._active_ids = []
+        self._start_event.clear()
+        self._start_ok = False
+        self._start_error = "init"
+
+        user32 = ctypes.windll.user32
+
+        def _worker():
+            self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+            msg = ctypes.wintypes.MSG()
+            # Ensure the message queue exists for this thread.
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            try:
+                for hotkey_id, (hotkey_str, _cb) in hotkey_defs.items():
+                    modifiers, vk = self._parse_hotkey(hotkey_str)
+                    if not user32.RegisterHotKey(None, int(hotkey_id), int(modifiers), int(vk)):
+                        err = ctypes.get_last_error()
+                        raise RuntimeError(
+                            f"RegisterHotKey failed for '{hotkey_str}' (id={hotkey_id}, winerr={err})"
+                        )
+                    self._active_ids.append(int(hotkey_id))
+                self._start_ok = True
+                self._start_error = ""
+            except Exception as exc:
+                self._start_ok = False
+                self._start_error = str(exc)
+            finally:
+                self._start_event.set()
+
+            if not self._start_ok:
+                for hid in self._active_ids:
+                    try:
+                        user32.UnregisterHotKey(None, int(hid))
+                    except Exception:
+                        pass
+                self._active_ids.clear()
+                return
+
+            while True:
+                rv = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if rv <= 0:
+                    break
+                if msg.message == self.WM_HOTKEY:
+                    hid = int(msg.wParam)
+                    cb = self._callbacks.get(hid)
+                    if cb is not None:
+                        try:
+                            cb()
+                        except Exception:
+                            traceback.print_exc()
+
+            for hid in self._active_ids:
+                try:
+                    user32.UnregisterHotKey(None, int(hid))
+                except Exception:
+                    pass
+            self._active_ids.clear()
+
+        self._thread = threading.Thread(target=_worker, daemon=True, name="global-hotkey-win32")
+        self._thread.start()
+        self._start_event.wait(timeout=3.0)
+        if not self._start_event.is_set():
+            return False, "timeout while starting hotkey thread"
+        return self._start_ok, (self._start_error or "ok")
+
+    def stop(self):
+        if self._thread is None:
+            return
+        try:
+            if self._thread_id:
+                ctypes.windll.user32.PostThreadMessageW(int(self._thread_id), self.WM_QUIT, 0, 0)
+        except Exception:
+            pass
+        self._thread.join(timeout=1.5)
+        self._thread = None
+        self._thread_id = 0
+        self._callbacks = {}
+        self._active_ids = []
+
+
+class _PynputGlobalHotkeys:
+    def __init__(self):
+        self._listener = None
+
+    @staticmethod
+    def _to_spec(hotkey_str: str) -> str:
+        parts = [p.strip().lower() for p in str(hotkey_str or "").split("+") if p.strip()]
+        converted = []
+        for token in parts:
+            if token in {"ctrl", "control"}:
+                converted.append("<ctrl>")
+            elif token == "shift":
+                converted.append("<shift>")
+            elif token == "alt":
+                converted.append("<alt>")
+            elif token in {"win", "meta"}:
+                converted.append("<cmd>")
+            else:
+                converted.append(token)
+        return "+".join(converted)
+
+    def start(self, hotkey_defs: dict[int, tuple[str, callable]]) -> tuple[bool, str]:
+        self.stop()
+        bindings: dict[str, callable] = {}
+        for _hid, (hotkey_str, cb) in hotkey_defs.items():
+            spec = self._to_spec(hotkey_str)
+            bindings[spec] = cb
+        try:
+            self._listener = pynput_keyboard.GlobalHotKeys(bindings)
+            self._listener.start()
+            return True, "ok"
+        except Exception as exc:
+            self._listener = None
+            return False, str(exc)
+
+    def stop(self):
+        if self._listener is None:
+            return
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
+        self._listener = None
 
 class HotkeyEdit(QLineEdit):
     """A line edit that captures keyboard shortcuts."""
@@ -287,9 +533,15 @@ class SettingsDialog(QDialog):
         if backend != "nllb":
             return True
 
+        source_lang = self._source_lang_combo.currentData()
         model_dir = self._runtime_path(self._config.get("nllb_model_dir", ".models/nllb-ct2-int8"))
         tok_path = self._runtime_path(self._config.get("nllb_tokenizer_path", ".models/nllb-ct2-int8"))
         errors: list[str] = []
+
+        if source_lang in {"auto", "", None}:
+            errors.append(
+                "- NLLB requires explicit source language (not Auto Detect)."
+            )
 
         if not model_dir.is_dir():
             errors.append(f"- Model dir not found: {model_dir}")
@@ -439,7 +691,7 @@ class SettingsDialog(QDialog):
         self._source_lang_combo = QComboBox()
         for code, name in SOURCE_LANGUAGES.items():
             self._source_lang_combo.addItem(f"{name} ({code})", code)
-        current_source = self._config.get("source_language", "ko")
+        current_source = self._config.get("source_language", "auto")
         idx = self._source_lang_combo.findData(current_source)
         if idx >= 0:
             self._source_lang_combo.setCurrentIndex(idx)
@@ -457,11 +709,12 @@ class SettingsDialog(QDialog):
 
         ll.addWidget(QLabel("Translation backend:"))
         self._translation_backend_combo = QComboBox()
-        self._translation_backend_combo.addItem("Auto (NLLB -> Argos -> Google)", "auto")
+        self._translation_backend_combo.addItem("Auto (NLLB -> Google)", "auto")
         self._translation_backend_combo.addItem("NLLB (Offline)", "nllb")
         self._translation_backend_combo.addItem("Google (Online)", "google")
-        self._translation_backend_combo.addItem("Argos (Offline)", "argos")
         current_backend = self._config.get("translation_backend", "auto")
+        if current_backend == "argos":
+            current_backend = "auto"
         idx = self._translation_backend_combo.findData(current_backend)
         if idx >= 0:
             self._translation_backend_combo.setCurrentIndex(idx)
@@ -472,18 +725,6 @@ class SettingsDialog(QDialog):
             bool(self._config.get("translation_fallback_to_google", True))
         )
         ll.addWidget(self._translation_fallback_cb)
-
-        ll.addWidget(QLabel("Argos pivot language:"))
-        self._argos_pivot_combo = QComboBox()
-        self._argos_pivot_combo.addItem("English (en)", "en")
-        self._argos_pivot_combo.addItem("Japanese (ja)", "ja")
-        self._argos_pivot_combo.addItem("Korean (ko)", "ko")
-        self._argos_pivot_combo.addItem("Chinese (zh)", "zh")
-        current_pivot = self._config.get("argos_pivot_language", "en")
-        idx = self._argos_pivot_combo.findData(current_pivot)
-        if idx >= 0:
-            self._argos_pivot_combo.setCurrentIndex(idx)
-        ll.addWidget(self._argos_pivot_combo)
 
         self._context_refine_cb = QCheckBox("Context refine for short bubbles")
         self._context_refine_cb.setChecked(
@@ -693,6 +934,34 @@ class SettingsDialog(QDialog):
         ol.addWidget(self._easyocr_cb)
 
         layout.addWidget(ocr_group)
+
+        guide_group = QGroupBox("Huong Dan Su Dung Chi Tiet")
+        gl = QVBoxLayout(guide_group)
+        guide_label = QLabel(
+            "1) Bat/Tat overlay:\n"
+            "   - Nhan hotkey trong Runtime (mac dinh: ctrl+shift+t).\n"
+            "   - Hoac click Tray > Toggle Overlay.\n\n"
+            "2) Doi phim nong:\n"
+            "   - Vao Settings > Hotkey, click o hotkey roi bam to hop moi.\n"
+            "   - Bam Save de ap dung ngay.\n\n"
+            "3) Chon backend dich:\n"
+            "   - NLLB (Offline): dich local, on dinh khi da co model.\n"
+            "   - Google (Online): can internet, thuong cho ket qua muot.\n\n"
+            "4) Diagnostics:\n"
+            "   - Tray > Diagnostics de xem OCR backend, MT backend, hotkey backend,\n"
+            "     va trang thai dang ky hotkey.\n\n"
+            "5) Khac phuc su co nhanh:\n"
+            "   - Neu hotkey khong an duoc: mo Diagnostics, kiem tra hotkey_backend.\n"
+            "   - Neu OCR yeu: thu bat WinRT OCR hoac dieu chinh confidence.\n"
+            "   - Neu dich cham: dung NLLB local, giam capture interval, bat cache.\n\n"
+            "6) Chu y:\n"
+            "   - Ctrl+Shift+M dung de Freeze/Resume frame hien tai."
+        )
+        guide_label.setWordWrap(True)
+        guide_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        guide_label.setStyleSheet("color: #d8d8e8; font-size: 12px; line-height: 1.35;")
+        gl.addWidget(guide_label)
+        layout.addWidget(guide_group)
         layout.addStretch(1)
 
         btn_layout = QHBoxLayout()
@@ -734,7 +1003,6 @@ class SettingsDialog(QDialog):
         self._config["target_language"] = self._target_lang_combo.currentData()
         self._config["translation_backend"] = self._translation_backend_combo.currentData()
         self._config["translation_fallback_to_google"] = self._translation_fallback_cb.isChecked()
-        self._config["argos_pivot_language"] = self._argos_pivot_combo.currentData()
         self._config["translation_context_refine_enabled"] = self._context_refine_cb.isChecked()
         self._config["translation_context_refine_max_chars"] = self._context_max_chars_spin.value()
         self._config["translation_context_refine_max_words"] = self._context_max_words_spin.value()
@@ -793,6 +1061,63 @@ def create_tray_icon() -> QPixmap:
     return pixmap
 
 
+class StartupStatusOverlay(QWidget):
+    """Lightweight status window shown while heavy overlay startup is in progress."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        panel = QWidget(self)
+        panel.setStyleSheet(
+            """
+            background: rgba(12, 16, 28, 230);
+            color: #f5f8ff;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 12px;
+            """
+        )
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(16, 12, 16, 12)
+        panel_layout.setSpacing(4)
+
+        self._title = QLabel("Screen Translator")
+        self._title.setStyleSheet("font-weight: 700; font-size: 13px;")
+
+        self._status = QLabel("Dang khoi tao...")
+        self._status.setStyleSheet("font-size: 12px; color: #d6def0;")
+
+        panel_layout.addWidget(self._title)
+        panel_layout.addWidget(self._status)
+        root.addWidget(panel)
+
+        self.setFixedSize(320, 84)
+
+    def show_status(self, message: str):
+        self._status.setText(message)
+        self._center_on_screen()
+        self.show()
+        self.raise_()
+
+    def _center_on_screen(self):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        geo = screen.availableGeometry()
+        x = geo.x() + (geo.width() - self.width()) // 2
+        y = geo.y() + (geo.height() - self.height()) // 2
+        self.move(x, y)
+
+
 class ScreenTranslatorApp:
     """Main application controller."""
 
@@ -800,17 +1125,44 @@ class ScreenTranslatorApp:
         self._app = QApplication(sys.argv)
         self._app.setQuitOnLastWindowClosed(False)
         self._qt_message_handler = None
+        # Qt tray balloon windows are unstable on some frozen Windows runtimes.
+        # Hard-disable in release runtime to avoid QtTrayIconMessageWindow crashes.
+        self._tray_messages_enabled = not getattr(sys, "frozen", False)
 
         self._config = load_config()
         self._overlay: OverlayWindow | None = None
+        self._overlay_initializing = False
+        self._startup_status = StartupStatusOverlay()
         self._tray: QSystemTrayIcon | None = None
-        self._hotkey_listener = None
-        self._pressed_keys = set()
+        self._hotkey_backend = "none"
+        self._hotkey_status = "not registered"
+        self._hotkey_native = _WindowsGlobalHotkeys()
+        self._hotkey_fallback = _PynputGlobalHotkeys()
+        self._hotkey_dispatcher = _HotkeyDispatcher()
+        self._hotkey_dispatcher.toggle_overlay.connect(
+            lambda: self._safe_call(self._toggle_overlay, "hotkey-toggle")
+        )
+        self._hotkey_dispatcher.toggle_freeze.connect(
+            lambda: self._safe_call(self._toggle_freeze, "hotkey-freeze")
+        )
 
         self._setup_qt_logging()
         self._setup_tray()
+        self._notify_starting()
         self._register_hotkey()
+        self._notify_ready()
         self._setup_autotest_hooks()
+
+    def _tray_show_message(self, title: str, message: str, icon, timeout_ms: int = 4000):
+        if self._tray is None:
+            return
+        if not self._tray_messages_enabled:
+            print(f"[Tray] Message skipped (disabled): {title} | {message}", flush=True)
+            return
+        try:
+            self._tray.showMessage(title, message, icon, int(timeout_ms))
+        except Exception as exc:
+            print(f"[Tray] showMessage failed: {exc}", flush=True)
 
     def _setup_autotest_hooks(self):
         """Optional test hooks for packaged smoke tests."""
@@ -862,7 +1214,7 @@ class ScreenTranslatorApp:
             print(f"[UI] Callback failure: {context}", flush=True)
             traceback.print_exc()
             if self._tray is not None:
-                self._tray.showMessage(
+                self._tray_show_message(
                     "Screen Translator",
                     f"Internal error in {context}. Check logs in %APPDATA%\\ScreenTranslator\\logs.",
                     QSystemTrayIcon.MessageIcon.Critical,
@@ -911,6 +1263,13 @@ class ScreenTranslatorApp:
             lambda _checked=False: self._safe_call(self._show_settings, "tray-settings")
         )
 
+        diagnostics_action = QAction("Diagnostics", self._app)
+        diagnostics_action.triggered.connect(
+            lambda _checked=False: self._safe_call(
+                self._show_diagnostics, "tray-diagnostics"
+            )
+        )
+
         quit_action = QAction("Quit", self._app)
         quit_action.triggered.connect(
             lambda _checked=False: self._safe_call(self._quit, "tray-quit")
@@ -919,145 +1278,157 @@ class ScreenTranslatorApp:
         menu.addAction(toggle_action)
         menu.addSeparator()
         menu.addAction(settings_action)
+        menu.addAction(diagnostics_action)
         menu.addSeparator()
         menu.addAction(quit_action)
 
         self._tray.setContextMenu(menu)
-        self._tray.setToolTip("Screen Translator - Press " + self._config["hotkey"])
+        self._tray.setToolTip("Screen Translator - Starting...")
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.show()
-        print("[Tray] Icon initialized", flush=True)
-
-        # Show notification
-        self._tray.showMessage(
-            "Screen Translator",
-            f"App is running. Press {self._config['hotkey']} to toggle overlay.",
-            QSystemTrayIcon.MessageIcon.Information,
-            3000,
+        print(
+            f"[Tray] Icon initialized (messages_enabled={self._tray_messages_enabled})",
+            flush=True,
         )
 
-    def _parse_hotkey(self, hotkey_str: str):
-        """Parse hotkey string like 'ctrl+shift+t' into pynput keys."""
-        key_map = {
-            'ctrl': pynput_keyboard.Key.ctrl_l,
-            'shift': pynput_keyboard.Key.shift_l,
-            'alt': pynput_keyboard.Key.alt_l,
-        }
-        parts = hotkey_str.lower().split('+')
-        keys = set()
-        for part in parts:
-            part = part.strip()
-            if part in key_map:
-                keys.add(key_map[part])
-            elif len(part) == 1:
-                keys.add(pynput_keyboard.KeyCode.from_char(part))
-            else:
-                # Try as Key attribute (e.g., 'f1', 'space')
-                try:
-                    keys.add(getattr(pynput_keyboard.Key, part))
-                except AttributeError:
-                    keys.add(pynput_keyboard.KeyCode.from_char(part))
-        return keys
+        # Author credit message
+        self._tray_show_message(
+            "Screen Translator",
+            AUTHOR_CREDIT_MESSAGE,
+            QSystemTrayIcon.MessageIcon.Information,
+            5000,
+        )
+
+    def _notify_starting(self):
+        if self._tray is None:
+            return
+        self._tray.setToolTip("Screen Translator - Dang khoi dong...")
+        self._tray_show_message(
+            "Screen Translator",
+            "App dang khoi dong, vui long cho...",
+            QSystemTrayIcon.MessageIcon.Information,
+            4500,
+        )
+
+    def _notify_ready(self):
+        if self._tray is None:
+            return
+        hotkey = self._config.get("hotkey", "ctrl+shift+t")
+        self._tray.setToolTip(
+            f"Screen Translator - Ready ({hotkey}) [{self._hotkey_backend}]"
+        )
+        self._tray_show_message(
+            "Screen Translator",
+            f"Khoi dong thanh cong. Nhan {hotkey} de bat/tat overlay.",
+            QSystemTrayIcon.MessageIcon.Information,
+            5000,
+        )
 
     def _register_hotkey(self):
-        """Register global hotkey using pynput (no admin required)."""
-        try:
-            # Stop existing listener
-            if self._hotkey_listener:
-                self._hotkey_listener.stop()
-                self._hotkey_listener = None
+        """Register global hotkeys with native Win32 first, then fallback to pynput."""
+        self._hotkey_native.stop()
+        self._hotkey_fallback.stop()
 
-            hotkey = self._config.get("hotkey", "ctrl+shift+t")
-            self._target_keys = self._parse_hotkey(hotkey)
-            self._freeze_keys = self._parse_hotkey("ctrl+shift+m")
-            self._pressed_keys = set()
+        main_hotkey = self._config.get("hotkey", "ctrl+shift+t")
+        freeze_hotkey = "ctrl+shift+m"
+        hotkey_defs = {
+            1: (main_hotkey, self._hotkey_dispatcher.toggle_overlay.emit),
+            2: (freeze_hotkey, self._hotkey_dispatcher.toggle_freeze.emit),
+        }
 
-            def on_press(key):
-                self._pressed_keys.add(key)
-                # Normalize: check both left/right modifiers
-                if self._check_hotkey_match(self._target_keys):
-                    QTimer.singleShot(0, self._toggle_overlay)
-                elif self._check_hotkey_match(self._freeze_keys):
-                    QTimer.singleShot(0, self._toggle_freeze)
+        ok_native, native_reason = self._hotkey_native.start(hotkey_defs)
+        if ok_native:
+            self._hotkey_backend = "win32"
+            self._hotkey_status = "registered"
+            print(f"[Hotkey] Registered via win32: {main_hotkey}", flush=True)
+            return
 
-            def on_release(key):
-                self._pressed_keys.discard(key)
-
-            self._hotkey_listener = pynput_keyboard.Listener(
-                on_press=on_press,
-                on_release=on_release,
+        ok_fallback, fallback_reason = self._hotkey_fallback.start(hotkey_defs)
+        if ok_fallback:
+            self._hotkey_backend = "pynput"
+            self._hotkey_status = f"win32 failed: {native_reason}"
+            print(
+                f"[Hotkey] Win32 failed, using pynput. reason={native_reason}",
+                flush=True,
             )
-            self._hotkey_listener.daemon = True
-            self._hotkey_listener.start()
-            print(f"[Hotkey] Registered: {hotkey}", flush=True)
-        except Exception as e:
-            print(f"[Hotkey] Failed to register: {e}", flush=True)
+            return
 
-    def _check_hotkey_match(self, target_keys: set) -> bool:
-        """Check if currently pressed keys match the target hotkey."""
-        for target in target_keys:
-            matched = False
-            for pressed in self._pressed_keys:
-                if target == pressed:
-                    matched = True
-                    break
-                # Handle left/right modifier variants
-                if isinstance(target, pynput_keyboard.Key):
-                    name = target.name
-                    if name.endswith('_l'):
-                        try:
-                            right = getattr(pynput_keyboard.Key, name[:-2] + '_r')
-                            if pressed == right:
-                                matched = True
-                                break
-                        except AttributeError:
-                            pass
-                # Handle KeyCode case-insensitive match
-                if isinstance(target, pynput_keyboard.KeyCode) and isinstance(pressed, pynput_keyboard.KeyCode):
-                    if target.char and pressed.char and target.char.lower() == pressed.char.lower():
-                        matched = True
-                        break
-            if not matched:
-                return False
-        return True
+        self._hotkey_backend = "none"
+        self._hotkey_status = (
+            f"win32 failed: {native_reason}; pynput failed: {fallback_reason}"
+        )
+        print(f"[Hotkey] Failed: {self._hotkey_status}", flush=True)
+        if self._tray is not None:
+            self._tray_show_message(
+                "Screen Translator",
+                "Khong dang ky duoc hotkey. Mo Diagnostics de xem chi tiet.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                6000,
+            )
 
     def _toggle_overlay(self):
         """Toggle the overlay window visibility."""
         try:
+            print("[HotkeyCase] toggle_overlay:begin", flush=True)
+            if self._overlay_initializing:
+                print("[Overlay] Initialization already in progress", flush=True)
+                self._startup_status.show_status("Dang khoi tao overlay... vui long doi")
+                self._app.processEvents()
+                return
+
             if self._overlay is None:
+                self._overlay_initializing = True
+                started = time.perf_counter()
+                self._startup_status.show_status("Dang nap OCR va translator...")
+                self._app.processEvents()
                 try:
-                    self._overlay = OverlayWindow(self._config)
-                except Exception as e:
-                    print(f"[Overlay] Failed to create overlay: {e}", flush=True)
-                    self._tray.showMessage(
-                        "Screen Translator",
-                        "Overlay startup failed once. Retrying with current settings.",
-                        QSystemTrayIcon.MessageIcon.Warning,
-                        3500,
-                    )
                     try:
                         self._overlay = OverlayWindow(self._config)
-                    except Exception as e2:
-                        print(f"[Overlay] Retry create overlay failed: {e2}", flush=True)
-                        self._tray.showMessage(
+                    except Exception as e:
+                        print(f"[Overlay] Failed to create overlay: {e}", flush=True)
+                        self._startup_status.show_status("Khoi tao loi, dang thu lai...")
+                        self._app.processEvents()
+                        self._tray_show_message(
                             "Screen Translator",
-                            "Overlay failed to start. Check logs in %APPDATA%\\ScreenTranslator\\logs.",
-                            QSystemTrayIcon.MessageIcon.Critical,
-                            5000,
+                            "Overlay startup failed once. Retrying with current settings.",
+                            QSystemTrayIcon.MessageIcon.Warning,
+                            3500,
                         )
-                        return
+                        try:
+                            self._overlay = OverlayWindow(self._config)
+                        except Exception as e2:
+                            print(f"[Overlay] Retry create overlay failed: {e2}", flush=True)
+                            self._tray_show_message(
+                                "Screen Translator",
+                                "Overlay failed to start. Check logs in %APPDATA%\\ScreenTranslator\\logs.",
+                                QSystemTrayIcon.MessageIcon.Critical,
+                                5000,
+                            )
+                            return
+                    self._startup_status.show_status("Khoi tao xong, dang hien thi...")
+                    self._app.processEvents()
+                    self._overlay.show()
+                    self._overlay.activateWindow()
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    print(f"[HotkeyCase] toggle_overlay:show (cold_start_ms={elapsed_ms})", flush=True)
+                finally:
+                    self._overlay_initializing = False
+                    self._startup_status.hide()
+                return
 
             if self._overlay.isVisible():
                 self._overlay.hide()
+                print("[HotkeyCase] toggle_overlay:hide", flush=True)
             else:
                 self._overlay.show()
                 self._overlay.activateWindow()
+                print("[HotkeyCase] toggle_overlay:show", flush=True)
         except Exception:
             print("[Overlay] Unexpected toggle failure", flush=True)
             traceback.print_exc()
             self._overlay = None
             if self._tray is not None:
-                self._tray.showMessage(
+                self._tray_show_message(
                     "Screen Translator",
                     "Overlay crashed while toggling. Please check logs.",
                     QSystemTrayIcon.MessageIcon.Critical,
@@ -1074,6 +1445,11 @@ class ScreenTranslatorApp:
                 self._overlay._is_frozen = False
                 self._overlay._on_tick()
                 self._overlay._is_frozen = True
+                print("[HotkeyCase] freeze:enabled", flush=True)
+            else:
+                print("[HotkeyCase] freeze:disabled", flush=True)
+        else:
+            print("[HotkeyCase] freeze:ignored_overlay_not_visible", flush=True)
 
     def _show_settings(self):
         """Show settings dialog."""
@@ -1082,47 +1458,90 @@ class ScreenTranslatorApp:
             old_hotkey = self._config.get("hotkey")
             self._config = dialog.get_config()
 
-            # Re-register hotkey if changed
+            # Always re-register to recover from stale/hijacked registrations.
+            self._register_hotkey()
             if self._config.get("hotkey") != old_hotkey:
-                self._register_hotkey()
-                # Update tray menu
                 self._setup_tray()
+            else:
+                self._tray.setToolTip(
+                    f"Screen Translator - Ready ({self._config.get('hotkey', 'ctrl+shift+t')}) [{self._hotkey_backend}]"
+                )
 
             # Recreate overlay with new settings if it exists
             if self._overlay is not None:
-                was_visible = self._overlay.isVisible()
-                geo = self._overlay.geometry()
-                self._overlay.close()
+                old_overlay = self._overlay
+                was_visible = old_overlay.isVisible()
+                geo = old_overlay.geometry()
                 try:
-                    self._overlay = OverlayWindow(self._config)
+                    candidate_overlay = OverlayWindow(self._config)
                 except Exception as e:
                     print(f"[Overlay] Failed to apply new settings: {e}", flush=True)
-                    self._tray.showMessage(
+                    self._tray_show_message(
                         "Screen Translator",
-                        "Failed to apply new settings. Keeping your selected backend.",
+                        "Failed to apply new settings. Keeping previous overlay.",
                         QSystemTrayIcon.MessageIcon.Warning,
                         3500,
                     )
-                    self._overlay = OverlayWindow(self._config)
+                    self._overlay = old_overlay
+                    return
+
+                self._overlay = candidate_overlay
                 self._overlay.setGeometry(geo)
                 if was_visible:
                     self._overlay.show()
+                    self._overlay.activateWindow()
+                old_overlay.close()
+
+    def _show_diagnostics(self):
+        lines = [
+            "Screen Translator Diagnostics",
+            "",
+            f"hotkey: {self._config.get('hotkey', 'ctrl+shift+t')}",
+            f"hotkey_backend: {self._hotkey_backend}",
+            f"hotkey_status: {self._hotkey_status}",
+            f"source_language: {self._config.get('source_language', 'auto')}",
+            f"target_language: {self._config.get('target_language', 'vi')}",
+            f"translation_backend_config: {self._config.get('translation_backend', 'auto')}",
+            f"translation_fallback_to_google: {bool(self._config.get('translation_fallback_to_google', True))}",
+        ]
+
+        if self._overlay is None:
+            lines.append("")
+            lines.append("overlay: not created yet")
+        else:
+            snap = self._overlay.diagnostics_snapshot()
+            lines.append("")
+            lines.append("overlay:")
+            for key in (
+                "overlay_visible",
+                "safe_boot_native",
+                "ocr_backend",
+                "mt_backend",
+                "detected_blocks",
+                "translated_blocks",
+            ):
+                lines.append(f"  {key}: {snap.get(key, 'unknown')}")
+
+        QMessageBox.information(
+            None,
+            "Diagnostics",
+            "\n".join(lines),
+        )
 
     def _on_tray_activated(self, reason):
         """Handle tray icon activation."""
         print(f"[Tray] Activated: {reason}", flush=True)
-        if reason in (
-            QSystemTrayIcon.ActivationReason.Trigger,
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-        ):
+        # On Windows, a double click can emit both Trigger and DoubleClick.
+        # Handle Trigger only to avoid toggling overlay twice.
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._safe_call(self._toggle_overlay, "tray-activate")
 
     def _quit(self):
         """Quit the application."""
         if self._overlay:
             self._overlay.close()
-        if self._hotkey_listener:
-            self._hotkey_listener.stop()
+        self._hotkey_native.stop()
+        self._hotkey_fallback.stop()
         self._tray.hide()
         self._app.quit()
 
@@ -1147,5 +1566,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

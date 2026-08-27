@@ -1,12 +1,14 @@
 ﻿# overlay.py - Transparent overlay window with live translation
 import ctypes
 import ctypes.wintypes
+import threading
 import traceback
 import sys
 import os
+import time
 import numpy as np
 from PyQt6.sip import voidptr
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QCursor
 from PyQt6.QtWidgets import QWidget, QApplication
 
@@ -85,6 +87,11 @@ class OverlayWindow(QWidget):
     TITLE_BAR_HEIGHT = 24
     BORDER_WIDTH = 4
     MIN_SIZE = 150
+    services_ready = pyqtSignal(object, object)
+    services_failed = pyqtSignal(str)
+    WDA_NONE = 0x0
+    WDA_MONITOR = 0x1
+    WDA_EXCLUDEFROMCAPTURE = 0x11
 
     @staticmethod
     def _cfg_int(config: dict, key: str, default: int) -> int:
@@ -101,20 +108,22 @@ class OverlayWindow(QWidget):
         safe_boot_env = str(os.getenv("ST_SAFE_BOOT_NATIVE", "1")).strip().lower()
         self._safe_boot_native = frozen and safe_boot_env not in {"0", "false", "off", "no"}
         if self._safe_boot_native:
-            # Safe boot for packaged builds: stick to the most stable OCR path.
+            # Safe boot for packaged builds: prefer bundled OCR/runtime pieces only.
+            # Do not depend on Windows OCR language packs in release mode.
             self._config["safe_boot_native"] = True
-            self._config["winrt_enabled"] = True
+            self._config["winrt_enabled"] = False
             self._config["easyocr_enabled"] = False
-            self._config["primary_backend"] = "winrt"
+            self._config["primary_backend"] = "rapidocr"
             self._config["fallback_backend"] = "none"
             print(
-                "[SafeBoot] Enabled (WinRT OCR primary, translation config preserved)",
+                "[SafeBoot] Enabled (bundled OCR primary, translation config preserved)",
                 flush=True,
             )
         self._capture = ScreenCapture()
         source_lang = self._config.get("source_language", "en")
-        self._ocr = OCREngine(source_language=source_lang, config=self._config)
-        self._translator = self._create_translator(source_lang)
+        self._source_lang = source_lang
+        self._ocr = None
+        self._translator = _PassthroughTranslator()
         self._renderer = TextRenderer(
             font_family=self._config.get("font_family", "Segoe UI"),
             text_color=self._config.get("text_color", "#000000"),
@@ -133,17 +142,12 @@ class OverlayWindow(QWidget):
         self._text_blocks: list[TextBlock] = []
         self._translated_texts: list[str] = []
 
-        # Async pipeline (replaces TranslationWorker)
-        self._pipeline = AsyncTranslationPipeline(
-            ocr_engine=self._ocr,
-            translator=self._translator,
-            parent=self,
-            drop_frames_when_busy=bool(self._config.get("drop_frames_when_busy", True)),
-        )
-        self._pipeline.result_ready.connect(self._on_result)
-        self._pipeline.pipeline_error.connect(
-            lambda msg: print(f"[Pipeline] Error: {msg}", flush=True)
-        )
+        self._pipeline: AsyncTranslationPipeline | None = None
+        self._services_initializing = False
+        self._services_ready = False
+        self._services_error: str | None = None
+        self.services_ready.connect(self._on_services_ready)
+        self.services_failed.connect(self._on_services_failed)
 
         # Whether the OS excludes our window from screen capture
         # (set in showEvent â€” requires Win10 Build 2004+)
@@ -166,9 +170,59 @@ class OverlayWindow(QWidget):
 
         self._setup_ui()
         self._setup_timer()
-        # Pre-warm OCR backends in a background thread so app starts quickly
-        import threading
-        threading.Thread(target=self._ocr.warm_up, daemon=True, name="ocr-warmup").start()
+        self._start_services_init()
+
+    def _start_services_init(self):
+        if self._services_initializing or self._services_ready:
+            return
+        self._services_initializing = True
+        started = threading.get_native_id() if hasattr(threading, "get_native_id") else None
+        self._services_started_at = time.perf_counter()
+        print(f"[Overlay] Services init started thread={started}", flush=True)
+
+        def _worker():
+            try:
+                ocr = OCREngine(source_language=self._source_lang, config=self._config)
+                translator = self._create_translator(self._source_lang)
+                self.services_ready.emit(ocr, translator)
+            except Exception as exc:
+                self.services_failed.emit(str(exc))
+
+        threading.Thread(target=_worker, daemon=True, name="overlay-init").start()
+
+    def _on_services_ready(self, ocr, translator):
+        self._ocr = ocr
+        self._translator = translator
+        self._pipeline = AsyncTranslationPipeline(
+            ocr_engine=self._ocr,
+            translator=self._translator,
+            parent=self,
+            drop_frames_when_busy=bool(self._config.get("drop_frames_when_busy", True)),
+        )
+        self._pipeline.result_ready.connect(self._on_result)
+        self._pipeline.pipeline_error.connect(
+            lambda msg: print(f"[Pipeline] Error: {msg}", flush=True)
+        )
+        self._services_initializing = False
+        self._services_ready = True
+        self._services_error = None
+        elapsed_ms = 0
+        try:
+            elapsed_ms = int((time.perf_counter() - self._services_started_at) * 1000)
+        except Exception:
+            pass
+        print(f"[Overlay] OCR/translator ready ({elapsed_ms}ms)", flush=True)
+
+    def _on_services_failed(self, message: str):
+        self._services_initializing = False
+        self._services_ready = False
+        self._services_error = message
+        elapsed_ms = 0
+        try:
+            elapsed_ms = int((time.perf_counter() - self._services_started_at) * 1000)
+        except Exception:
+            pass
+        print(f"[Overlay] OCR/translator init failed ({elapsed_ms}ms): {message}", flush=True)
 
     def _create_translator(self, source_lang: str):
         common_kwargs = dict(
@@ -197,6 +251,10 @@ class OverlayWindow(QWidget):
             game_post_edit_enabled=bool(self._config.get("translation_game_post_edit_enabled", True)),
             auto_source_routing_enabled=bool(
                 self._config.get("translation_auto_source_routing_enabled", True)
+            ),
+            language_detector_backend=self._config.get("language_detector_backend", "langid"),
+            language_detector_min_confidence=float(
+                self._config.get("language_detector_min_confidence", 0.55)
             ),
             semantic_cache_enabled=bool(
                 self._config.get("translation_semantic_cache_enabled", True)
@@ -231,6 +289,29 @@ class OverlayWindow(QWidget):
             flush=True,
         )
         return _PassthroughTranslator()
+
+    def diagnostics_snapshot(self) -> dict[str, str]:
+        mt_backend = getattr(
+            self._translator,
+            "backend_display_name",
+            getattr(self._translator, "backend_name", "unknown"),
+        )
+        return {
+            "overlay_visible": str(bool(self.isVisible())),
+            "safe_boot_native": str(bool(self._safe_boot_native)),
+            "ocr_backend": str(getattr(self._ocr, "backend_name", "loading")),
+            "mt_backend": str(mt_backend),
+            "source_language": str(self._config.get("source_language", "auto")),
+            "target_language": str(self._config.get("target_language", "vi")),
+            "translation_backend_config": str(
+                self._config.get("translation_backend", "auto")
+            ),
+            "translation_fallback_to_google": str(
+                bool(self._config.get("translation_fallback_to_google", True))
+            ),
+            "detected_blocks": str(len(self._text_blocks)),
+            "translated_blocks": str(len(self._translated_texts)),
+        }
 
     def _setup_ui(self):
         """Configure the overlay window."""
@@ -269,6 +350,29 @@ class OverlayWindow(QWidget):
         if hasattr(self, "_content") and self._content is not None:
             self._content.setWindowOpacity(opacity)
 
+    def _apply_display_affinity(self, enabled: bool):
+        if os.name != "nt":
+            self._overlay_excluded = False
+            return
+        try:
+            user32 = ctypes.windll.user32
+            flag = self.WDA_EXCLUDEFROMCAPTURE if enabled else self.WDA_NONE
+            hwnds = [int(self.winId())]
+            if hasattr(self, "_content") and self._content is not None:
+                hwnds.append(int(self._content.winId()))
+            ok_all = True
+            for hwnd in hwnds:
+                ok = bool(user32.SetWindowDisplayAffinity(hwnd, flag))
+                ok_all = ok_all and ok
+            self._overlay_excluded = bool(enabled and ok_all)
+            print(
+                f"[Capture] DisplayAffinity enabled={enabled} result={self._overlay_excluded}",
+                flush=True,
+            )
+        except Exception as exc:
+            self._overlay_excluded = False
+            print(f"[Capture] DisplayAffinity unavailable: {exc}", flush=True)
+
     def showEvent(self, event):
         """Start translation loop when shown."""
         super().showEvent(event)
@@ -277,16 +381,17 @@ class OverlayWindow(QWidget):
             self._content.setGeometry(self.geometry())
             self._content.show()
         self._timer.start()
-        # We explicitly set `_overlay_excluded` to False and omit SetWindowDisplayAffinity.
-        # This allows screen capture tools (OBS, ShareX) to see the translated text.
-        # The app will naturally fall back to "Mode B: opacity toggle" to prevent self-reading.
-        self._overlay_excluded = False
-        print("[Capture] Screen capture visibility enabled - using opacity fallback for OCR", flush=True)
+        self._apply_display_affinity(True)
+        if self._overlay_excluded:
+            print("[Capture] Overlay excluded from screen capture", flush=True)
+        else:
+            print("[Capture] Screen capture visibility enabled - using opacity fallback for OCR", flush=True)
         QTimer.singleShot(300, self._on_tick)
 
     def hideEvent(self, event):
         """Stop translation loop when hidden."""
         super().hideEvent(event)
+        self._apply_display_affinity(False)
         self._last_dirty_sample = None
         if hasattr(self, "_content"):
             self._content.hide()
@@ -299,7 +404,8 @@ class OverlayWindow(QWidget):
         if hasattr(self, "_content"):
             self._content.close()
         self._timer.stop()
-        self._pipeline.shutdown()
+        if self._pipeline is not None:
+            self._pipeline.shutdown()
         self._capture.close()
         super().closeEvent(event)
 
@@ -361,6 +467,12 @@ class OverlayWindow(QWidget):
         if self._is_frozen:
             return
 
+        if not self._services_ready or self._pipeline is None:
+            return
+
+        if self._pipeline._worker.is_processing():
+            return
+
         try:
             geo = self.geometry()
             H_MARGIN = 4
@@ -375,14 +487,18 @@ class OverlayWindow(QWidget):
 
             if self._overlay_excluded:
                 # â”€â”€ Mode A: direct capture, no flicker ever â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                t_cap = time.perf_counter()
                 image = self._capture.capture_region(cx, cy, cw, ch)
+                print(f"[Perf] Capture={(time.perf_counter()-t_cap)*1000:.0f}ms mode=excluded", flush=True)
                 self._pipeline.submit(image)  # deduped by hash inside
             else:
                 # â”€â”€ Mode B: hash check first, hide only on change â”€â”€â”€â”€â”€â”€â”€â”€
                 # Capture with overlay visible â€” slightly dirty but fast.
                 # Compare dirty-to-dirty (not dirty-to-clean) to avoid a
                 # permanent mismatch loop when overlay text changes the image.
+                t_dirty = time.perf_counter()
                 dirty = self._capture.capture_region(cx, cy, cw, ch)
+                dirty_ms = (time.perf_counter() - t_dirty) * 1000
                 dirty_sample = self._make_dirty_sample(dirty)
                 if not self._dirty_changed(dirty_sample):
                     return  # static frame - skip entirely, no flicker/re-ocr
@@ -391,8 +507,14 @@ class OverlayWindow(QWidget):
                 # Content changed â€” hide overlay to get a clean frame
                 self._set_capture_hidden(True)
                 QApplication.processEvents()
+                t_clean = time.perf_counter()
                 clean = self._capture.capture_region(cx, cy, cw, ch)
+                clean_ms = (time.perf_counter() - t_clean) * 1000
                 self._set_capture_hidden(False)
+                print(
+                    f"[Perf] CaptureDirty={dirty_ms:.0f}ms CaptureClean={clean_ms:.0f}ms mode=opacity",
+                    flush=True,
+                )
                 self._pipeline.submit(clean)
 
         except Exception:
@@ -444,8 +566,17 @@ class OverlayWindow(QWidget):
             "backend_display_name",
             getattr(self._translator, "backend_name", "?"),
         )
-        is_busy = self._pipeline._worker.isRunning() and self._pipeline._worker._image is not None
-        status = "BUSY" if is_busy else f"OK {len(self._text_blocks)}"
+        is_busy = bool(
+            self._pipeline is not None
+            and self._pipeline._worker.isRunning()
+            and self._pipeline._worker._image is not None
+        )
+        if not self._services_ready:
+            status = "LOADING"
+        elif self._services_error:
+            status = "ERROR"
+        else:
+            status = "BUSY" if is_busy else f"OK {len(self._text_blocks)}"
         painter.drawText(
             QRect(8, 0, w - 50, self.TITLE_BAR_HEIGHT),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,

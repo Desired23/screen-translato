@@ -58,17 +58,6 @@ if ($Flavor -eq "full") {
     } else {
         Write-Warning "Flavor 'full' selected but .models folder is missing. Offline NLLB translation will not be bundled."
     }
-
-    $easyModelSrc = Join-Path $env:USERPROFILE ".EasyOCR\model"
-    $easyModelDstDist = Join-Path $repoRoot "dist\ScreenTranslator\.easyocr\model"
-    if (Test-Path $easyModelSrc) {
-        Write-Host "==> Copying EasyOCR models into dist bundle"
-        Remove-Item -Recurse -Force $easyModelDstDist -ErrorAction SilentlyContinue
-        New-Item -ItemType Directory -Path $easyModelDstDist -Force | Out-Null
-        Copy-Item -Recurse -Force "$easyModelSrc\*" $easyModelDstDist
-    } else {
-        Write-Warning "EasyOCR model cache not found at $easyModelSrc. Packaged app may need internet on first OCR run."
-    }
 }
 
 $releaseRoot = Join-Path $repoRoot "release"

@@ -13,6 +13,14 @@ import numpy as np
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 
+def _safe_log_text(text: str, limit: int = 60) -> str:
+    snippet = str(text or "").replace("\n", " ").strip()[:limit]
+    try:
+        return snippet.encode("unicode_escape").decode("ascii", errors="ignore")
+    except Exception:
+        return repr(snippet)
+
+
 @dataclass
 class PipelineResult:
     blocks: list        # list[TextBlock]
@@ -80,7 +88,11 @@ class _Worker(QThread):
             # ── OCR ───────────────────────────────────────────────────
             t_ocr = time.perf_counter()
             blocks = self._ocr_smart(image)
+            raw_blocks = list(blocks)
             print(f"[Perf] OCR={( time.perf_counter()-t_ocr)*1000:.0f}ms  blocks={len(blocks)}", flush=True)
+            if blocks:
+                preview = " | ".join(f"{i}:'{_safe_log_text(b.text, 60)}'" for i, b in enumerate(blocks[:3]))
+                print(f"[OCR] Preview blocks: {preview}", flush=True)
 
             if self._cancel.is_set():
                 return
@@ -96,10 +108,12 @@ class _Worker(QThread):
             line_blocks = merge_same_line_blocks(blocks)
             blocks = line_blocks
             cfg = getattr(self._ocr, "_config", {})
+            layout_mode = "line"
             if cfg.get("paragraph_merge_enabled", True):
                 if cfg.get("auto_document_line_mode_enabled", True) and self._looks_like_document_frame(
                     line_blocks, cfg
                 ):
+                    layout_mode = "document"
                     if cfg.get("auto_document_translate_by_paragraph", True):
                         doc_blocks = merge_paragraph_blocks(
                             line_blocks,
@@ -135,9 +149,26 @@ class _Worker(QThread):
                             flush=True,
                         )
                         blocks = line_blocks
+                elif cfg.get("auto_dialog_ui_mode_enabled", True) and self._looks_like_dialog_ui_frame(
+                    line_blocks, image, cfg
+                ):
+                    layout_mode = "dialog-ui"
+                    dialog_blocks = self._merge_dialog_ui_blocks(line_blocks, image, cfg)
+                    if len(dialog_blocks) != len(line_blocks):
+                        print(
+                            f"[OCR] Dialog UI merge ({len(line_blocks)} -> {len(dialog_blocks)})",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[OCR] Dialog UI detected ({len(line_blocks)} lines) -> keep block-level layout",
+                            flush=True,
+                        )
+                    blocks = dialog_blocks
                 elif cfg.get("auto_ui_line_mode_enabled", True) and self._looks_like_ui_game_frame(
                     line_blocks, cfg
                 ):
+                    layout_mode = "ui-game"
                     if cfg.get("ui_panel_merge_enabled", True):
                         panel_blocks = self._merge_ui_panel_blocks(line_blocks, cfg)
                         if len(panel_blocks) != len(line_blocks):
@@ -177,6 +208,11 @@ class _Worker(QThread):
                         blocks = line_blocks
                     else:
                         blocks = merged_blocks
+
+            if cfg.get("log_game_layout_debug", True) and layout_mode in {"dialog-ui", "ui-game"}:
+                self._log_block_stage("raw", raw_blocks)
+                self._log_block_stage("line", line_blocks)
+                self._log_block_stage("final", blocks)
 
             # ── Translate ─────────────────────────────────────────────
             if self._cancel.is_set():
@@ -365,6 +401,124 @@ class _Worker(QThread):
                 )
             )
         )
+
+    @staticmethod
+    def _count_cjk_chars(text: str) -> int:
+        return len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]", str(text or "")))
+
+    @staticmethod
+    def _log_block_stage(stage: str, blocks: list) -> None:
+        print(f"[OCRDBG] {stage}_blocks={len(blocks)}", flush=True)
+        for i, block in enumerate(blocks[:12]):
+            print(
+                "[OCRDBG] "
+                f"{stage}[{i}] text='{_safe_log_text(getattr(block, 'text', ''), 90)}' "
+                f"bbox=({getattr(block, 'x', 0)},{getattr(block, 'y', 0)},{getattr(block, 'width', 0)},{getattr(block, 'height', 0)}) "
+                f"conf={getattr(block, 'confidence', 0.0):.2f}",
+                flush=True,
+            )
+
+    def _looks_like_speaker_block(self, block, image: np.ndarray, cfg: dict) -> bool:
+        text = getattr(block, "text", "").strip()
+        if not text:
+            return False
+        h = max(int(image.shape[0]), 1)
+        w = max(int(image.shape[1]), 1)
+        choice_cut = h * float(cfg.get("auto_dialog_ui_choice_ratio", 0.86))
+        speaker_min_y = h * float(cfg.get("dialog_ui_speaker_min_y_ratio", 0.62))
+        if block.y < speaker_min_y or block.y >= choice_cut:
+            return False
+        if block.width > w * float(cfg.get("dialog_ui_speaker_max_width_ratio", 0.22)):
+            return False
+        if len(text) > int(cfg.get("dialog_ui_speaker_max_chars", 10)):
+            return False
+        return self._count_cjk_chars(text) >= max(2, len(text) // 2)
+
+    def _looks_like_top_hud_block(self, block, image: np.ndarray, cfg: dict) -> bool:
+        text = getattr(block, "text", "").strip()
+        if not text:
+            return False
+        h = max(int(image.shape[0]), 1)
+        w = max(int(image.shape[1]), 1)
+        if block.y > h * float(cfg.get("dialog_ui_hud_max_y_ratio", 0.68)):
+            return False
+        if block.width > w * float(cfg.get("dialog_ui_hud_max_width_ratio", 0.42)):
+            return False
+        if block.height > h * float(cfg.get("dialog_ui_hud_max_height_ratio", 0.16)):
+            return False
+        if len(text) > int(cfg.get("dialog_ui_hud_max_chars", 18)):
+            return False
+        return self._count_cjk_chars(text) >= max(2, len(text) // 3)
+
+    def _looks_like_dialog_ui_frame(self, blocks: list, image: np.ndarray, cfg: dict) -> bool:
+        if not blocks:
+            return False
+        n = len(blocks)
+        if n < int(cfg.get("auto_dialog_ui_mode_min_blocks", 4)):
+            return False
+        if n > int(cfg.get("auto_dialog_ui_mode_max_blocks", 10)):
+            return False
+
+        h = max(int(image.shape[0]), 1)
+        bottom_cut = h * float(cfg.get("auto_dialog_ui_bottom_ratio", 0.72))
+        choice_cut = h * float(cfg.get("auto_dialog_ui_choice_ratio", 0.86))
+
+        long_dialog = 0
+        bottom_blocks = 0
+        choice_like = 0
+        cjk_blocks = 0
+
+        for block in blocks:
+            text = getattr(block, "text", "").strip()
+            if not text:
+                continue
+            if self._count_cjk_chars(text) >= max(4, len(text) // 3):
+                cjk_blocks += 1
+            if len(text) >= 12 and re.search(r"[。！？!?…]$", text):
+                long_dialog += 1
+            if block.y >= bottom_cut:
+                bottom_blocks += 1
+            if block.y >= choice_cut and len(text) <= 18:
+                choice_like += 1
+
+        return cjk_blocks >= max(2, n // 2) and long_dialog >= 1 and bottom_blocks >= 2 and choice_like >= 2
+
+    def _merge_dialog_ui_blocks(self, line_blocks: list, image: np.ndarray, cfg: dict) -> list:
+        if not line_blocks:
+            return line_blocks
+
+        h = max(int(image.shape[0]), 1)
+        choice_cut = h * float(cfg.get("auto_dialog_ui_choice_ratio", 0.86))
+        preserved: list = []
+        mergeable: list = []
+        for block in line_blocks:
+            text = getattr(block, "text", "").strip()
+            if self._looks_like_top_hud_block(block, image, cfg):
+                preserved.append(block)
+            elif self._looks_like_speaker_block(block, image, cfg):
+                preserved.append(block)
+            elif block.y >= choice_cut and len(text) <= 18:
+                preserved.append(block)
+            else:
+                mergeable.append(block)
+
+        if not mergeable:
+            return sorted(preserved, key=lambda b: (b.y, b.x))
+
+        from ocr_engine import merge_paragraph_blocks
+
+        merged_dialog = merge_paragraph_blocks(
+            mergeable,
+            max_lines_per_group=int(cfg.get("dialog_ui_max_lines_per_group", 3)),
+            min_overlap_ratio=float(cfg.get("dialog_ui_min_overlap_ratio", 0.52)),
+            center_distance_factor=float(cfg.get("dialog_ui_center_distance_factor", 0.40)),
+            max_width_expand_ratio=float(cfg.get("dialog_ui_max_width_expand_ratio", 1.28)),
+        )
+
+        combined = list(merged_dialog or mergeable)
+        combined.extend(preserved)
+        combined.sort(key=lambda b: (b.y, b.x))
+        return combined
 
     def _merge_ui_panel_blocks(self, line_blocks: list, cfg: dict) -> list:
         """Merge nearby UI/game lines inside the same panel, not across whole frame."""

@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     "document_paragraph_center_distance_factor": 0.85,
     "document_paragraph_max_width_expand_ratio": 3.00,
     "ocr_smart_max_boxes": 80,
-    "source_language": "ko",
+    "source_language": "auto",
     "target_language": "vi",
     "overlay_opacity": 0.85,
     "font_family": "Segoe UI",
@@ -71,15 +71,50 @@ DEFAULT_CONFIG = {
     "title_bar_color": "#1a1a2e",
     # OCR backend strategy
     "primary_backend": "rapidocr",
-    "fallback_backend": "paddleocr",
+    "fallback_backend": "none",
     "confidence_thresh": 0.75,
     "winrt_enabled": False,
+    # If WinRT falls back to another language pack (e.g. ja -> en),
+    # keep it as a last-resort OCR path instead of disabling all OCR.
+    "allow_winrt_mismatch_fallback": True,
     "easyocr_enabled": False,
+    # Optional bundled PaddleOCR models for CJK-heavy fallback OCR in release zip.
+    # When present, app will load models from this local bundle instead of
+    # relying on user-level PaddleX caches under %USERPROFILE%.
+    "paddleocr_enabled": True,
+    "paddle_model_root": ".models/paddleocr",
+    "paddle_text_detection_model_dir": "",
+    "paddle_text_recognition_model_dir": "",
+    "paddle_textline_orientation_model_dir": "",
+    "paddle_device": "cpu",
+    "paddle_enable_mkldnn": False,
+    "paddle_cpu_threads": 2,
+    # limit expensive Paddle rescue to a few suspicious lines instead of whole frames
+    "paddle_region_rescue_max_regions": 2,
+    "paddle_region_rescue_max_lines_per_region": 2,
     # optional slower second-pass OCR enhancements for noisy manga pages
     "rapid_quality_retry": False,
     # static-frame dedup tuning (higher thresholds = less re-scan noise)
     "dirty_mad_threshold": 4.5,
     "dirty_changed_ratio_threshold": 0.02,
+    # visual-novel / dating-sim style dialog layout heuristics
+    "auto_dialog_ui_mode_enabled": True,
+    "auto_dialog_ui_mode_min_blocks": 4,
+    "auto_dialog_ui_mode_max_blocks": 10,
+    "auto_dialog_ui_bottom_ratio": 0.72,
+    "auto_dialog_ui_choice_ratio": 0.86,
+    "dialog_ui_hud_max_y_ratio": 0.68,
+    "dialog_ui_hud_max_width_ratio": 0.42,
+    "dialog_ui_hud_max_height_ratio": 0.16,
+    "dialog_ui_hud_max_chars": 18,
+    "dialog_ui_speaker_min_y_ratio": 0.62,
+    "dialog_ui_speaker_max_width_ratio": 0.22,
+    "dialog_ui_speaker_max_chars": 10,
+    "dialog_ui_max_lines_per_group": 3,
+    "dialog_ui_min_overlap_ratio": 0.52,
+    "dialog_ui_center_distance_factor": 0.40,
+    "dialog_ui_max_width_expand_ratio": 1.28,
+    "log_game_layout_debug": True,
     # merge nearby OCR lines into paragraph blocks before translation
     "paragraph_merge_enabled": True,
     # conservative bubble-aware paragraph merge (to avoid cross-bubble merging)
@@ -87,12 +122,10 @@ DEFAULT_CONFIG = {
     "paragraph_min_overlap_ratio": 0.25,
     "paragraph_center_distance_factor": 0.65,
     "paragraph_max_width_expand_ratio": 2.20,
-    # translation backend: auto (prefer local NLLB, then Argos, then Google), nllb, argos, google
+    # translation backend: auto (prefer local NLLB, then Google), nllb, google
     "translation_backend": "auto",
-    # if argos fails/unavailable, fallback to Google automatically
+    # if nllb fails/unavailable, fallback to Google automatically
     "translation_fallback_to_google": True,
-    # for offline Argos when direct xx->vi is not installed, try xx->en->vi
-    "argos_pivot_language": "en",
     # local NLLB (CTranslate2) backend options
     "nllb_model_dir": ".models/nllb-ct2-int8",
     "nllb_tokenizer_path": ".models/nllb-ct2-int8",
@@ -116,8 +149,11 @@ DEFAULT_CONFIG = {
     # preserve key game terms + small post-edits for game skill text
     "translation_game_term_guard_enabled": True,
     "translation_game_post_edit_enabled": True,
-    # auto-route source language per OCR script for local backends (nllb/argos)
+    # auto-route source language per OCR script for local backend (nllb)
     "translation_auto_source_routing_enabled": True,
+    # language detector: script heuristics first, then langid for ambiguous Latin OCR.
+    "language_detector_backend": "langid",
+    "language_detector_min_confidence": 0.55,
     # reuse translations for near-identical OCR lines to reduce jitter cost
     "translation_semantic_cache_enabled": True,
     "custom_glossary_enabled": True,

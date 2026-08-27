@@ -17,11 +17,15 @@ from pathlib import Path
 WATCH_EXTS = {".py", ".json"}
 IGNORE_DIRS = {
     ".git",
+    ".logs",
     "__pycache__",
     ".venv",
     "venv",
     ".mypy_cache",
     ".pytest_cache",
+}
+IGNORE_FILES = {
+    "settings.json",
 }
 POLL_INTERVAL_SEC = 0.6
 
@@ -33,6 +37,8 @@ def _iter_files(root: Path):
         if path.suffix.lower() not in WATCH_EXTS:
             continue
         if any(part in IGNORE_DIRS for part in path.parts):
+            continue
+        if path.name in IGNORE_FILES:
             continue
         yield path
 

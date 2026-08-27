@@ -7,22 +7,22 @@ hiddenimports = [
     "pynput.keyboard._win32",
     "pynput.mouse._win32",
     "rapidocr_onnxruntime",
-    "easyocr",
-    "winrt.windows.media.ocr",
-    "winrt.windows.graphics.imaging",
-    "winrt.windows.storage.streams",
-    "argostranslate.translate",
+    "paddle",
+    "paddlex",
+    "paddleocr",
     "ctranslate2",
     "transformers",
     "sentencepiece",
 ]
 
 excludes = [
+    "torch",
     "torchvision",
     "torchaudio",
-    "paddleocr",
+    "easyocr",
+    "argostranslate",
+    "winrt",
     "spacy",
-    "modelscope",
     "tensorflow",
     "matplotlib",
     "pandas",
@@ -33,9 +33,14 @@ excludes = [
 ]
 
 datas = []
-for pkg in ("rapidocr_onnxruntime", "argostranslate"):
+for pkg in ("rapidocr_onnxruntime", "paddleocr", "paddlex", "paddle"):
     datas += collect_data_files(pkg, include_py_files=False)
-binaries = collect_dynamic_libs("torch")
+binaries = []
+for pkg in ("onnxruntime", "ctranslate2", "paddle"):
+    try:
+        binaries += collect_dynamic_libs(pkg)
+    except Exception:
+        pass
 
 
 a = Analysis(

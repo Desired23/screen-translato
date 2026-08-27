@@ -30,3 +30,4 @@ Thumbs.db
 # Local model/data caches
 .models/
 .tmp/
+.logs/

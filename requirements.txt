@@ -1,19 +1,19 @@
 PyQt6>=6.5
 mss>=9.0
 pynput>=0.13
-easyocr>=1.7
 deep-translator>=1.11
 Pillow>=10.0
 numpy>=1.24
 
-# optional accelerated/alternate OCR engines
-# install these if you plan to benchmark or use them; the code will
-# fall back gracefully when they are missing.
-winrt>=1.0              # Windows OCR API (requires language pack installed)
-rapidocr-onnxruntime>=0.4  # lightweight super-fast CPU OCR
-paddleocr>=2.7          # fallback engine (slower than rapid, faster than EasyOCR)
-argostranslate>=1.9     # optional offline translation backend (requires language package install)
-ctranslate2>=4.3        # optional for local NLLB inference backend
-transformers>=4.43      # optional for local NLLB tokenizer/backend
-sentencepiece>=0.2      # tokenizer dependency used by NLLB models
-huggingface-hub>=0.24   # optional model download helper for NLLB installer
+# OCR engines used by this app (EN/JA/KO/ZH-CN/ZH-TW)
+winrt>=1.0
+rapidocr-onnxruntime>=1.2
+
+# Optional language ID engine for ambiguous Latin OCR:
+langid>=1.1.6
+
+# Optional local/offline NLLB backend
+ctranslate2>=4.3
+transformers>=4.43
+sentencepiece>=0.2
+huggingface-hub>=0.24
